@@ -218,7 +218,7 @@ sasRefineIndicator::sasRefineIndicator
         (
             resultName_,
             mesh_.time().name(),
-            mesh_.thisDb(),
+            mesh_,
             IOobject::NO_READ,
             IOobject::NO_WRITE
         ),
@@ -244,7 +244,7 @@ tmp<volScalarField::Internal> sasRefineIndicator::makeTmpInternal
             (
                 name,
                 mesh_.time().name(),
-                mesh_.thisDb(),
+                mesh_,
                 IOobject::NO_READ,
                 IOobject::NO_WRITE,
                 false
@@ -380,7 +380,7 @@ tmp<volScalarField::Internal> sasRefineIndicator::markCoreOddScaler
     {
         dMaxLocal = max(dMaxLocal, d[i]);
     }
-    const scalar dMax = returnReduce(dMaxLocal, maxOp<scalar>());
+    const scalar dMax = returnReduce(dMaxLocal, maxOp());
 
     DebugInfo
         << "Calculated dMax = " << dMax << " for zone " << zone_ << nl;
@@ -400,7 +400,7 @@ tmp<volScalarField::Internal> sasRefineIndicator::markCoreOddScaler
         G[celli] = u * oneMinusExpNeg(x);
     }
     // Normalise by maximum value of G for d > -shift
-    // const scalar maxG = gMax(G);
+    // const scalar maxG = gMax(G.primitiveField());
     // for (const label i : cells)
     // {
     //     const scalar u = d[i] + shift;
@@ -408,7 +408,7 @@ tmp<volScalarField::Internal> sasRefineIndicator::markCoreOddScaler
     //     G[i] = (u > 0.0) ? Gi/maxG : Gi;
     // }
     // Normalise by maximum value of G
-    const scalar maxG = gMax(G);
+    const scalar maxG = gMax(G.primitiveField());
     if (maxG > SMALL)
     {
         G /= maxG;
@@ -455,7 +455,7 @@ sasRefineIndicator::markCoreSafeScaler
     {
         dMaxLocal = max(dMaxLocal, d[i]);
     }
-    const scalar dMax = returnReduce(dMaxLocal, maxOp<scalar>());
+    const scalar dMax = returnReduce(dMaxLocal, maxOp());
 
     DebugInfo
         << "Calculated dMax = " << dMax << " for zone " << zone_ << nl;
@@ -494,7 +494,7 @@ sasRefineIndicator::markCoreSafeScaler
     }
 
     // Normalise by maximum value of G for d > -shift
-    // const scalar maxG = gMax(G);
+    // const scalar maxG = gMax(G.primitiveField());
     // for (const label i : cells)
     // {
     //     const scalar u = d[i] + shift;
@@ -502,7 +502,7 @@ sasRefineIndicator::markCoreSafeScaler
     //     G[i] = (u > 0.0) ? Gi/maxG : Gi;
     // }
     // Normalise by maximum value of G
-    const scalar maxG = gMax(G);
+    const scalar maxG = gMax(G.primitiveField());
     if (maxG > SMALL)
     {
         G /= maxG;
@@ -685,8 +685,8 @@ void sasRefineIndicator::calcIndicator()
         }
         DebugInfo
             << name() << " (" << resultName_ << "): found "
-            << returnReduce(nPos, sumOp<label>()) << "/"
-            << returnReduce(cells.size(), sumOp<label>())
+            << returnReduce(nPos, sumOp()) << "/"
+            << returnReduce(cells.size(), sumOp())
             << " cells with indicator >= 0: " << endl;
     }
 }
