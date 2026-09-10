@@ -25,6 +25,7 @@ License
 
 #include "mykOmegaSSTSAS.H"
 #include "fvcLaplacian.H"
+#include "fviLaplacian.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -56,7 +57,7 @@ void mykOmegaSSTSAS<BasicMomentumTransportModel>::makeDumpField
                 this->runTime_.time().name(),
                 this->mesh_,
                 IOobject::NO_READ,
-                IOobject::NO_WRITE
+                IOobject::AUTO_WRITE
             ),
             this->mesh_,
             dimensionedScalar(dimensionSet(0, 1, 0, 0, 0), Zero)
@@ -91,7 +92,7 @@ inline void mykOmegaSSTSAS<BasicMomentumTransportModel>::setDumpField
     makeDumpField(fld, name);
 
     // Assign internal values
-    fld->primitiveFieldRef() = vals;
+    fld->primitiveFieldRef() = vals.primitiveField();
 }
 
 template<class BasicMomentumTransportModel>
@@ -112,7 +113,7 @@ tmp<fvScalarMatrix> mykOmegaSSTSAS<BasicMomentumTransportModel>::Qsas
     (
         kappa_*sqrt(S2)
         /(
-            mag(fvc::laplacian(this->U_))()()
+            mag(fvi::laplacian(this->U_))
             + dimensionedScalar
             (
                 "ROOTVSMALL",
@@ -189,11 +190,11 @@ mykOmegaSSTSAS<BasicMomentumTransportModel>::mykOmegaSSTSAS
         viscosity
     ),
 
-    Cs_("Cs", this->coeffDict(), 0.11),
-    kappa_("kappa", this->coeffDict(), 0.41),
-    zeta2_("zeta2", this->coeffDict(), 3.51),
-    sigmaPhi_("sigmaPhi", this->coeffDict(), 2.0/3.0),
-    C_("C", this->coeffDict(), 2),
+    Cs_("Cs", this->typeDict(type), 0.11),
+    kappa_("kappa", this->typeDict(type), 0.41),
+    zeta2_("zeta2", this->typeDict(type), 3.51),
+    sigmaPhi_("sigmaPhi", this->typeDict(type), 2.0/3.0),
+    C_("C", this->typeDict(type), 2),
 
     delta_
     (
@@ -201,7 +202,7 @@ mykOmegaSSTSAS<BasicMomentumTransportModel>::mykOmegaSSTSAS
         (
             this->groupName("delta"),
             *this,
-            this->coeffDict()
+            this->typeDict(type)
         )
     )
 {
@@ -218,11 +219,11 @@ bool mykOmegaSSTSAS<BasicMomentumTransportModel>::read()
 {
     if (kOmegaSST<BasicMomentumTransportModel>::read())
     {
-        Cs_.readIfPresent(this->coeffDict());
-        kappa_.readIfPresent(this->coeffDict());
-        sigmaPhi_.readIfPresent(this->coeffDict());
-        zeta2_.readIfPresent(this->coeffDict());
-        C_.readIfPresent(this->coeffDict());
+        Cs_.readIfPresent(this->typeDict());
+        kappa_.readIfPresent(this->typeDict());
+        sigmaPhi_.readIfPresent(this->typeDict());
+        zeta2_.readIfPresent(this->typeDict());
+        C_.readIfPresent(this->typeDict());
 
         return true;
     }

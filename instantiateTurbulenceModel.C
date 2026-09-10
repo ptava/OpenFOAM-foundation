@@ -34,7 +34,6 @@ License
 #include "fvmDiv.H"
 #include "fvcDiv.H"
 #include "fvcGrad.H"
-#include "fvcMagSqrGradGrad.H"
 #include "fvcMeshPhi.H"
 
 
@@ -42,5 +41,4 @@ License
 makeRASModel(mykOmegaSSTSAS);
 
 // ************************************************************************* //
-
 
