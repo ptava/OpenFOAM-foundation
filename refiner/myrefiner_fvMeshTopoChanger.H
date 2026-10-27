@@ -198,7 +198,11 @@ class myrefiner
 
         label unrefineInterval_;
 
-        label maxCells_;
+        //- Global cell count captured before the first adaptation
+        const label initialCells_;
+
+        //- Time-dependent budget for the initial refinement selection
+        autoPtr<Function1<scalar>> maxCells_;
 
         label nBufferLayers_;
 
@@ -247,8 +251,6 @@ class myrefiner
 
         //- cellError before smoothing
         mutable autoPtr<volScalarField> cellError_;
-        //- Scale function for cells refinement (e.g., for startup)
-        mutable autoPtr<Function1<scalar>> refineScale_;
 
     // Private Member Functions
 
@@ -285,8 +287,8 @@ class myrefiner
             const word& name
         ) const;
 
-        // Current scale value
-        scalar currentScale() const;
+        //- Current cell budget, validated against the initial cell count
+        label currentMaxCells(const label initialCells) const;
 
         // Current refinement interval
         label currentRefineInterval() const;
@@ -399,8 +401,7 @@ class myrefiner
                 const label maxCells,
                 const label maxRefinement,
                 const PackedBoolList& candidateCell,
-                const scalarField& cellError,
-                const scalar& scale
+                const scalarField& cellError
             ) const;
 
             //- Select points that can be unrefined.

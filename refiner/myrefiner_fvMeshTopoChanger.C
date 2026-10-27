@@ -96,21 +96,30 @@ void Foam::fvMeshTopoChangers::myrefiner::resetDumpInfo()
     setInfo("lowerLimit", nan);
 }
 
-Foam::scalar Foam::fvMeshTopoChangers::myrefiner::currentScale() const
+Foam::label Foam::fvMeshTopoChangers::myrefiner::currentMaxCells
+(
+    const label initialCells
+) const
 {
-    if (!refineScale_.valid()) return 1.0;
+    const scalar rawMaxCells = maxCells_->value(mesh().time().value());
 
-    const scalar scale = refineScale_->value(mesh().time().value());
-
-    if (scale < 0.0 || scale > 1.0)
+    if (rawMaxCells < initialCells)
     {
-        FatalErrorInFunction
-            << "Refinement scale must be between 0 and 1" << endl
-            << "    Current value: " << scale << endl
-            << abort(FatalError);
+        FatalIOErrorInFunction(dict_)
+            << "maxCells must evaluate to at least the initial global cell count "
+            << initialCells << nl
+            << "    Time: " << mesh().time().value() << nl
+            << "    Current value: " << rawMaxCells << nl
+            << exit(FatalIOError);
     }
 
-    return scale;
+    const label maxCells = label(rawMaxCells);
+
+    DebugInfo
+        << "maxCells at time " << mesh().time().value()
+        << " = " << maxCells << endl;
+
+    return maxCells;
 }
 
 
@@ -297,16 +306,11 @@ void Foam::fvMeshTopoChangers::myrefiner::readDict()
     unrefineInterval_ =
         dict_.lookupOrDefault<label>("unrefineInterval", 1);
 
-    maxCells_ = dict_.lookup<label>("maxCells");
-
-    if (maxCells_ <= 0)
-    {
-        FatalIOErrorInFunction(dict_)
-            << "Illegal maximum number of cells " << maxCells_ << nl
-            << "The maxCells setting in the dynamicMeshDict should"
-            << " be > 0." << nl
-            << exit(FatalIOError);
-    }
+    maxCells_.reset
+    (
+        Function1<scalar>::New("maxCells", dimTime, dimless, dict_).ptr()
+    );
+    currentMaxCells(initialCells_);
 
     nBufferLayers_ = dict_.lookup<label>("nBufferLayers");
 
@@ -333,13 +337,6 @@ void Foam::fvMeshTopoChangers::myrefiner::readDict()
         dict_.lookupOrDefault<bool>("dumpProtectedCells", false);
     rebuildProtectedCells_ =
         dict_.lookupOrDefault<bool>("rebuildProtectedCells", false);
-    if (dict_.found("refineScale"))
-    {
-        refineScale_.reset
-        (
-            Function1<scalar>::New("refineScale", dimTime, dimless, dict_).ptr()
-        );
-    }
     if (dumpRefinementFields_)
     {
         makeDumpField(cellError_, "cellError");
@@ -1221,8 +1218,7 @@ Foam::labelList Foam::fvMeshTopoChangers::myrefiner::selectRefineCells
     const label maxCells,
     const label maxRefinement,
     const PackedBoolList& candidateCells,
-    const scalarField& cellError,
-    const scalar& scale
+    const scalarField& cellError
 ) const
 {
     // Every refined cell causes 7 extra cells
@@ -1274,13 +1270,7 @@ Foam::labelList Foam::fvMeshTopoChangers::myrefiner::selectRefineCells
     scalar lowerLimitLocal = GREAT;
 
     // Number of cells to select
-    label nToSelect = min(nCandidates, nTotToRefine);
-
-    // Apply scaling
-    if (scale != 1.0)
-    {
-        nToSelect = static_cast<label>(nToSelect * scale);
-    }
+    const label nToSelect = min(nCandidates, nTotToRefine);
 
     if (dumpRefinementInfo_)
     {
@@ -1297,7 +1287,7 @@ Foam::labelList Foam::fvMeshTopoChangers::myrefiner::selectRefineCells
     }
 
     // If we're not cutting selected cells, just pick them all
-    if (scale == 1.0 && nToSelect == nCandidates)
+    if (nToSelect == nCandidates)
     {
         forAll(candidateCells, celli)
         {
@@ -1848,6 +1838,7 @@ Foam::fvMeshTopoChangers::myrefiner::myrefiner(fvMesh& mesh, const dictionary& d
 :
     fvMeshTopoChanger(mesh),
     dict_(dict),
+    initialCells_(mesh.globalData().nTotalCells()),
     meshCutter_(mesh),
     dumpLevel_(false),
     dumpRefinementInfo_(false),
@@ -1917,7 +1908,11 @@ bool Foam::fvMeshTopoChangers::myrefiner::update()
     );
     unrefineInterval_ =
         dict_.lookupOrDefault<label>("unrefineInterval", 1);
-    maxCells_ = dict_.lookup<label>("maxCells");
+    maxCells_.reset
+    (
+        Function1<scalar>::New("maxCells", dimTime, dimless, dict_).ptr()
+    );
+    const label maxCells = currentMaxCells(initialCells_);
     dumpRefinementInfo_ =
         dict_.lookupOrDefault<bool>("dumpRefinementInfo", false);
     dumpRefinementFields_ =
@@ -1945,16 +1940,7 @@ bool Foam::fvMeshTopoChangers::myrefiner::update()
         return hasChanged;
     }
 
-    if (dict_.found("refineScale"))
-    {
-        refineScale_.reset
-        (
-            Function1<scalar>::New("refineScale", dimTime, dimless, dict_).ptr()
-        );
-    }
-
     scalarField cellError;
-    scalar scale = currentScale();
 
     // Note: cannot refine at time 0 since no V0 present since mesh not
     //       moved yet.
@@ -1962,13 +1948,8 @@ bool Foam::fvMeshTopoChangers::myrefiner::update()
     (
         mesh().time().timeIndex() > 0
      && mesh().time().timeIndex() % refineInterval == 0
-     && scale > 0
     )
     {
-        DebugInfo
-            << "Refinement scale at time " << mesh().time().value()
-            << " = " << scale << endl;
-
         // Cells marked for refinement or otherwise protected from unrefinement.
         PackedBoolList refineCells(mesh().nCells());
 
@@ -2043,7 +2024,7 @@ bool Foam::fvMeshTopoChangers::myrefiner::update()
             }
         }
 
-        if (mesh().globalData().nTotalCells() < maxCells_)
+        if (mesh().globalData().nTotalCells() < maxCells)
         {
             // Select subset of candidates. Take into account max allowable
             // cells, refinement level, protected cells.
@@ -2051,11 +2032,10 @@ bool Foam::fvMeshTopoChangers::myrefiner::update()
             (
                 selectRefineCells
                 (
-                    maxCells_,
+                    maxCells,
                     maxRefinement,
                     refinableCells,
-                    cellError,
-                    scale
+                    cellError
                 )
             );
 
