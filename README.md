@@ -19,7 +19,7 @@ Working on adaptive mesh refinement in OpenFOAM.
 
 1. Fix `myrefiner::distribute()` so redistribution also handles `protectedCells_`: distribute the cached list after `meshCutter_.distribute(map)`.
 2. Investigate whether mapping `refineCells` instead of `refinableCells` after refinement would affect unrefinement selection. The current mapping updates `refinableCells`, while unrefinement reads `refineCells`.
-
+3. about the known limitation of fluxes consistency: for now we're trying to address this problem working on the physical indicator transfer function (shifted `safeScaler` function object) and on the low value threshold supplied to the refinement engine.
 
 ---
 
