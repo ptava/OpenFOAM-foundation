@@ -68,6 +68,15 @@ Description
         - If \f$ c > 1.0 \f$, the function becomes more linear near 0
         - \f$ \sigma \in [0.0, 1.0] \f$ controls the width of the transition region
 
+        markCoreSafeScaler:
+        Localised damping of the positive oddScaler branch. Finite alpha >= 0
+        sets endpoint/continuous maximum = 1-alpha. alpha=0 recovers
+        oddScaler continuously, and sigma controls the width for all alpha.
+        alpha=1 gives a zero endpoint; alpha>1 gives a negative endpoint.
+        The field is normalised by its global cell maximum. Output values
+        therefore vary with the sampled inputs; the cell endpoint ratio can
+        differ from 1-alpha when cells miss the continuous peak.
+
         c) markCoreGaussSink:
         gaussian-like function peaking where nLvk = Lvk / c2 = 1, and decays for
         increasing values of nLvk:
@@ -171,13 +180,6 @@ public:
 
 protected:
 
-    // ---- Container for mathematically derived coefficients
-    struct optimizationCoeffs
-    {
-        scalar tStar;
-        scalar Khat;
-    };
-
     // ---- User options
     word             zone_;
     focusRegion      focusRegion_;
@@ -203,13 +205,6 @@ protected:
     (
         const word& name,
         const dimensionedScalar& init
-    ) const;
-
-    //- Calculate or retrieve cached optimization coefficients (tStar, Khat)
-    optimizationCoeffs getOptimizationCoeffs
-    (
-        const scalar weight,
-        const scalar alpha
     ) const;
 
     //- Transform field without modification
@@ -239,7 +234,8 @@ protected:
         const scalar sigma
     ) const;
 
-    //- Transform field via gaussian function with dampening term
+    //- Localised damping of the positive oddScaler branch.
+    //  alpha=0 recovers oddScaler; sigma is active for all finite alpha >= 0.
     tmp<volScalarField::Internal> markCoreSafeScaler
     (
         const cellZone& cells,

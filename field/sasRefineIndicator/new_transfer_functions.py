@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -35,14 +34,6 @@ FUNCTION_PARAMETERS = {
     "gaussSinkCore": ("weight2", "sigma"),
     "gaussSinkPeriphery": ("weight2", "sigma"),
 }
-
-
-@dataclass(frozen=True)
-class OptimizationCoefficients:
-    """Dimensionless coefficients used by the safe scaler."""
-
-    t_star: float
-    k_hat: float
 
 
 def _as_values(values: np.ndarray) -> np.ndarray:
@@ -94,100 +85,45 @@ def odd_scaler_transfer(
     return _normalize_by_max(result)
 
 
-def _expm1_safe(value: float) -> float:
-    if abs(value) < 1.0e-6:
-        return value + 0.5 * value * value
-    return math.expm1(value)
+def _log_endpoint_ratio_magnitude(
+    log_end: float, p: float, negative_end: bool,
+) -> float:
+    log_damping = (
+        math.log1p(math.exp(log_end))
+        if negative_end else math.log(-math.expm1(log_end))
+    )
+    return log_end + (log_damping + math.log1p(p)) / p + math.log1p(1.0 / p)
 
 
-def _one_minus_exp_negative(value: float) -> float:
-    if abs(value) < 1.0e-6:
-        return value - 0.5 * value * value
-    return -math.expm1(-value)
+def _damping_endpoint(alpha: float) -> float:
+    """Return 1-c, retaining precision near alpha=1."""
 
-
-def _q_of(value: float) -> float:
-    if value > 700.0:
+    if alpha == 1.0:
         return 0.0
-    denominator = _expm1_safe(value)
-    if abs(denominator) <= VSMALL:
-        return 2.0
-    return 2.0 * value / denominator
-
-
-def _g_of(t: float, alpha_eff: float, alpha_target: float) -> float:
-    if t <= 0.0:
-        return math.inf
-
-    alpha_squared = alpha_eff * alpha_eff
-    alpha_squared_t = alpha_squared * t
-    q = _q_of(alpha_squared_t)
-    numerator = 2.0 * alpha_eff * _one_minus_exp_negative(t)
-    denominator_a = _one_minus_exp_negative(alpha_squared_t)
-    denominator_b = 1.0 + alpha_squared + (1.0 - alpha_squared) * q
-    if abs(denominator_a) <= VSMALL or abs(denominator_b) <= VSMALL:
-        return math.inf
-    return numerator / (denominator_a * denominator_b) - alpha_target
-
-
-def _solve_t_star(alpha_eff: float, alpha_target: float) -> float:
-    t_min = 1.0e-12
-    t_max = 1.0e6
-    grid_size = 900
-
-    best_t = t_min
-    best_error = math.inf
-    t_low = t_min
-    g_low = _g_of(t_low, alpha_eff, alpha_target)
-    t_high = t_low
-    bracket_found = False
-
-    for index in range(1, grid_size):
-        fraction = index / (grid_size - 1)
-        t = t_min * math.pow(t_max / t_min, fraction)
-        g_value = _g_of(t, alpha_eff, alpha_target)
-        if abs(g_value) < best_error:
-            best_error = abs(g_value)
-            best_t = t
-        if g_low * g_value <= 0.0:
-            t_high = t
-            bracket_found = True
-            break
-        t_low = t
-        g_low = g_value
-
-    if not bracket_found:
-        return best_t
-
-    low = t_low
-    high = t_high
-    f_low = g_low
-    for _ in range(120):
-        midpoint = 0.5 * (low + high)
-        f_midpoint = _g_of(midpoint, alpha_eff, alpha_target)
-        if abs(f_midpoint) < 1.0e-12 or high - low < 1.0e-12:
-            return midpoint
-        if f_low * f_midpoint <= 0.0:
-            high = midpoint
+    p = 2.0 / alpha
+    negative_end = alpha > 1.0
+    log_target = math.log(alpha - 1.0) if negative_end else math.log1p(-alpha)
+    high = 0.0 if negative_end else -math.log1p(1.0 / p)
+    while (
+        negative_end
+        and _log_endpoint_ratio_magnitude(high, p, negative_end) < log_target
+    ):
+        high += 1.0
+    low = high - 1.0
+    while _log_endpoint_ratio_magnitude(low, p, negative_end) > log_target:
+        low -= max(1.0, abs(low))
+    for _ in range(100):
+        mid = 0.5 * (low + high)
+        if _log_endpoint_ratio_magnitude(mid, p, negative_end) < log_target:
+            low = mid
         else:
-            low = midpoint
-            f_low = f_midpoint
-    return 0.5 * (low + high)
-
-
-def _optimization_coefficients(
-    weight1: float,
-    alpha: float,
-) -> OptimizationCoefficients:
-    alpha_eff = (alpha + weight1) / (1.0 + weight1)
-    if not 0.0 < alpha_eff < 1.0:
-        raise ValueError("derived alphaEff must be in (0, 1)")
-
-    t_star = _solve_t_star(alpha_eff, alpha)
-    q_star = _q_of(alpha_eff * alpha_eff * t_star)
-    denominator = alpha_eff * alpha_eff * (1.0 - q_star)
-    k_hat = (1.0 + q_star) / denominator if abs(denominator) > VSMALL else 0.0
-    return OptimizationCoefficients(t_star=t_star, k_hat=k_hat)
+            high = mid
+    log_end = 0.5 * (low + high)
+    error = _log_endpoint_ratio_magnitude(log_end, p, negative_end) - log_target
+    if not math.isfinite(error) or abs(error) > math.sqrt(SMALL):
+        raise ValueError(f"cannot resolve safeScaler damping for alpha={alpha}")
+    endpoint = math.exp(log_end)
+    return -endpoint if negative_end else endpoint
 
 
 def safe_scaler_transfer(
@@ -196,32 +132,50 @@ def safe_scaler_transfer(
     sigma: float,
     alpha: float,
 ) -> np.ndarray | np.ma.MaskedArray:
-    """Apply ``markCoreSafeScaler`` to representative ``d`` values."""
+    """Apply localised damping, then normalize by the sampled maximum.
 
-    if alpha == 1.0:
+    alpha sets endpoint/continuous maximum = 1-alpha. The final endpoint
+    ratio can differ when the samples miss the continuous curve peak.
+    """
+
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("alpha must be finite and non-negative")
+    if not math.isfinite(sigma) or sigma <= SMALL:
+        raise ValueError("sigma must be finite and greater than zero")
+    if not math.isfinite(weight1) or weight1 < 0.0:
+        raise ValueError("weight1 must be finite and non-negative")
+    if 1.0 - alpha == 1.0:
         return odd_scaler_transfer(values, weight1, sigma)
 
     d = _as_values(values)
+    if d.size == 0 or not np.all(np.isfinite(d)):
+        raise ValueError("safeScaler requires a non-empty finite input field")
     d_max = float(np.max(d))
     if d_max <= SMALL:
         return np.ma.masked_all_like(d)
 
-    coefficients = _optimization_coefficients(weight1, alpha)
     shift = weight1 * d_max
-    u_max = max((1.0 + weight1) * d_max, SMALL)
-    sigma_star = u_max / max(math.sqrt(2.0 * coefficients.t_star), SMALL)
-    k_star = coefficients.k_hat / (u_max * u_max)
+    u_max = d_max + shift
+    inv_two_sigma2 = 0.5 / (sigma * sigma)
+    end_factor = -math.expm1(-u_max * u_max * inv_two_sigma2)
+    if not math.isfinite(u_max) or not end_factor > 0.0:
+        raise ValueError("cannot scale the oddScaler endpoint")
 
-    shifted = d + shift
-    result = shifted * (-np.expm1(-(shifted * shifted) / (2.0 * sigma_star * sigma_star)))
-    positive = shifted > 0.0
-    denominator = 1.0 + k_star * shifted[positive] * shifted[positive]
-    result[positive] = np.where(
-        denominator > SMALL,
-        result[positive] / denominator,
-        0.0,
-    )
-    return _normalize_by_max(result)
+    u = d + shift
+    result = (u / u_max) * (-np.expm1(-u * u * inv_two_sigma2)) / end_factor
+    result[d == d_max] = 1.0
+    positive = result > 0.0
+    b = result[positive]
+    log_power = 2.0 * np.log(np.minimum(b, 1.0)) / alpha
+    power = np.exp(log_power)
+    # endpoint = 1-c. This form preserves precision near alpha=1
+    # when evaluating b*(1-c*b^p), with p=2/alpha.
+    result[positive] *= -np.expm1(log_power) + _damping_endpoint(alpha) * power
+
+    maximum = float(np.max(result))
+    if not math.isfinite(maximum) or maximum <= VSMALL:
+        raise ValueError("safeScaler has no positive maximum after damping")
+    return result / maximum
 
 
 def _gauss_sink_transfer(
@@ -304,8 +258,6 @@ def _effective_parameter_values(
     """Return parameters that affect the selected curve."""
 
     names = FUNCTION_PARAMETERS[function_name]
-    if function_name == "safeScaler" and parameters["alpha"] != 1.0:
-        names = ("weight1", "alpha")
     return tuple(parameters[name] for name in names)
 
 
@@ -328,9 +280,17 @@ function.""",
     G=u*(1-exp(-u^2/(2*sigma^2)))
 
   safeScaler (core)
-    At alpha=1, this is oddScaler with the user-provided sigma. Otherwise,
-    OpenFOAM derives sigmaStar and kStar, evaluates the odd-scaler expression
-    with sigmaStar, then applies G=G/(1+kStar*u^2) only where u>0.
+    At alpha=0, this is oddScaler with the user-provided sigma.
+    For alpha>0, b=B(u)/B(uMax), with B the oddScaler base, and
+    G=b*(1-c*b^(2/alpha)) only where b>0. The coefficient c sets
+    endpoint/continuous maximum=1-alpha. The negative branch is undamped
+    before whole-curve normalization. As alpha approaches zero, this
+    recovers oddScaler. sigma is active for every alpha.
+    Finite alpha>=0 is allowed; alpha>1 gives a negative endpoint.
+    At alpha=1, the endpoint is zero.
+    Final output values vary with the samples used for normalization.
+    The endpoint ratio can differ from 1-alpha if samples miss the curve peak.
+    A field with no positive maximum after damping cannot be normalized.
 
   gaussSinkCore (core)
     nLvk=max(C1/C2,1)
@@ -341,7 +301,8 @@ function.""",
     G=exp(-(nLvk-1)^2/(2*sigma^2))-weight2*(nLvk-1)^2
 
   oddScaler and safeScaler divide the entire curve, including negative values,
-  by max(G) when max(G)>SMALL. basic, constant, gaussSinkCore, and
+  by max(G). oddScaler normalizes when max(G)>SMALL; safeScaler with alpha>0
+  requires a positive maximum after damping. basic, constant, gaussSinkCore, and
   gaussSinkPeriphery are not normalized. all plots all six functions in the
   order above.
 
@@ -349,9 +310,8 @@ PARAMETER OWNERSHIP
   weight1 affects oddScaler and safeScaler.
   weight2 affects constant, gaussSinkCore, and gaussSinkPeriphery.
   sigma affects oddScaler, gaussSinkCore, and gaussSinkPeriphery. For
-  safeScaler it is used only when alpha=1; otherwise the OpenFOAM algorithm
-  derives sigmaStar and kStar.
-  alpha affects safeScaler only.
+  safeScaler it controls the base width for every non-negative alpha.
+  alpha affects safeScaler only; endpoint/continuous maximum=1-alpha.
 
 COMPARISON CURVES
   --compare requires exactly one transfer function and may be repeated. Each
@@ -395,6 +355,7 @@ EXAMPLES
   python3 %(prog)s oddScaler --weight1 0.3 --sigma 0.1
   python3 %(prog)s oddScaler safeScaler --d-min -4 --d-max 4 --alpha 0.7
   python3 %(prog)s safeScaler --compare alpha=0.3 --compare alpha=1,sigma=0.1
+  python3 %(prog)s safeScaler --alpha 0 --compare alpha=1 --compare alpha=1.5 --d-min -6
   python3 %(prog)s oddScaler --compare weight1=0.3 --primary-alpha 0.15 --secondary-alpha 0.05
   python3 %(prog)s gaussSinkCore --nlvk-min 0 --nlvk-max 2 --weight2 1
   python3 %(prog)s gaussSinkPeriphery --nlvk-min 0 --nlvk-max 2 --weight2 1
@@ -462,14 +423,14 @@ EXAMPLES
         type=float,
         default=0.05,
         metavar="VALUE",
-        help="positive width for oddScaler, both gauss sinks, and safeScaler at alpha=1",
+        help="positive width for oddScaler, both gauss sinks, and safeScaler at every alpha",
     )
     parameters.add_argument(
         "--alpha",
         type=float,
         default=0.6,
         metavar="VALUE",
-        help="safeScaler target in the range (0, 1]",
+        help="non-negative safeScaler damping; endpoint/curve maximum=1-alpha; alpha>1 gives a negative endpoint",
     )
     parameters.add_argument(
         "--compare",
@@ -581,8 +542,8 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         parser.error("--weight1 and --weight2 must be non-negative")
     if args.sigma <= SMALL:
         parser.error("--sigma must be greater than zero")
-    if not 0.0 < args.alpha <= 1.0:
-        parser.error("--alpha must be in the range (0, 1]")
+    if args.alpha < 0.0:
+        parser.error("--alpha must be non-negative")
     if not 0.0 < args.primary_alpha <= 1.0:
         parser.error("--primary-alpha must be in the range (0, 1]")
     if not 0.0 <= args.secondary_alpha < args.primary_alpha:
@@ -625,15 +586,8 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
                 parser.error("comparison weights must be non-negative")
             if comparison["sigma"] <= SMALL:
                 parser.error("comparison sigma must be greater than zero")
-            if not 0.0 < comparison["alpha"] <= 1.0:
-                parser.error("comparison alpha must be in the range (0, 1]")
-            if (
-                function_name == "safeScaler"
-                and "sigma" in overrides
-                and comparison["alpha"] != 1.0
-            ):
-                parser.error("comparison sigma affects safeScaler only at alpha=1")
-
+            if comparison["alpha"] < 0.0:
+                parser.error("comparison alpha must be non-negative")
             effective_values = _effective_parameter_values(
                 function_name,
                 comparison,
@@ -891,15 +845,10 @@ def _curve_values_and_label(
             args.sigma,
             args.alpha,
         )
-        sigma_note = (
-            r", user $\sigma$ active"
-            if args.alpha == 1.0
-            else ""
-        )
         label = (
             rf"$w_1={_format_parameter(args.weight1)}$, "
-            rf"$\alpha={_format_parameter(args.alpha)}$"
-            f"{sigma_note}"
+            rf"$\alpha={_format_parameter(args.alpha)}$, "
+            rf"$\sigma={_format_parameter(args.sigma)}$"
         )
         return indicator, label
     if function_name == "gaussSinkCore":

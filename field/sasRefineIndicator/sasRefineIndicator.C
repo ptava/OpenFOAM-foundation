@@ -30,6 +30,8 @@ License
 #include "addToRunTimeSelectionTable.H"
 #include "IOobjectList.H"
 
+#include <cmath>
+
 namespace Foam
 {
 namespace functionObjects
@@ -48,127 +50,83 @@ const scalar alphaDefault = 0.6;
 
 
 // --- Mathematical helpers
-inline scalar expm1Safe(const scalar x)
-{
-    return (mag(x) < 1e-6) ? x + 0.5*sqr(x) : expm1(x);
-}
-
 inline scalar oneMinusExpNeg(const scalar x)
 {
     return (mag(x) < 1e-6) ? x - 0.5*sqr(x) : -expm1(-x);
 }
 
-// --- Auxiliary functions for markCoreSafeScaler
-inline scalar qOf(const scalar t)
+// For b*(1-c*b^p), the peak is [c*(p+1)]^(-1/p).
+scalar logEndpointRatioMagnitude
+(
+    const scalar logEnd,
+    const scalar p,
+    const bool negativeEnd
+)
 {
-    if (t > 700.0) return 0.0;
-    
-    const scalar denom = expm1Safe(t);
-    if (mag(denom) <= VSMALL) return 2.0;
-    
-    return 2.0*t/denom;
+    const scalar logDamping = negativeEnd ?
+        std::log1p(exp(logEnd)) : log(-expm1(logEnd));
+
+    return
+        logEnd
+      + (logDamping + std::log1p(p))/p
+      + std::log1p(1/p);
 }
 
-scalar gOf(const scalar t, const scalar alphaEff, const scalar alphaTarget)
+
+// Return 1-c, preserving endpoint precision when c is close to 1.
+scalar dampingEndpoint(const scalar alpha)
 {
-    if (t <= 0.0) return GREAT;
-
-    const scalar a2  = sqr(alphaEff);
-    const scalar a2t = a2*t;
-    const scalar q   = qOf(a2t);
-
-    const scalar num  = 2.0*alphaEff*oneMinusExpNeg(t);
-    const scalar denA = oneMinusExpNeg(a2t);
-    const scalar denB = 1.0 + a2 + (1.0 - a2)*q;
-
-    if (mag(denA) <= VSMALL || mag(denB) <= VSMALL) return GREAT;
-
-    return (num/(denA*denB)) - alphaTarget;
-}
-
-// Solves for tStar where beta(tStar) = alpha
-scalar solveTStar(const scalar alphaEff, const scalar alphaTarget)
-{
-    const scalar tMin = 1e-12;
-    const scalar tMax = 1e6;
-    const label nGrid = 900;
-
-    // 1. Grid Search
-    scalar bestT = tMin;
-    scalar bestErr = GREAT;
-    scalar tLo = tMin;
-    scalar gLo = gOf(tLo, alphaEff, alphaTarget);
-    scalar tHi = tLo;
-    bool bracketFound = false;
-
-    for (label i = 1; i < nGrid; ++i)
+    if (alpha == 1)
     {
-        const scalar s = scalar(i)/scalar(nGrid - 1);
-        const scalar t = tMin*pow(tMax/tMin, s);
-        const scalar gv = gOf(t, alphaEff, alphaTarget);
-
-        if (mag(gv) < bestErr)
-        {
-            bestErr = mag(gv);
-            bestT = t;
-        }
-
-        if (gLo*gv <= 0.0)
-        {
-            tHi = t;
-            bracketFound = true;
-            break;
-        }
-
-        tLo = t;
-        gLo = gv;
+        return 0;
     }
 
-    if (!bracketFound)
+    const scalar p = 2/alpha;
+    const bool negativeEnd = alpha > 1;
+    const scalar logTarget = negativeEnd ?
+        log(alpha - 1) : std::log1p(-alpha);
+    scalar hi = negativeEnd ? 0 : -std::log1p(1/p);
+
+    while
+    (
+        negativeEnd
+     && logEndpointRatioMagnitude(hi, p, negativeEnd) < logTarget
+    )
     {
-        return bestT;
+        hi += 1;
     }
 
-    // 2. Bisection Refinement
-    scalar a = tLo;
-    scalar b = tHi;
-    scalar fa = gLo;
-    
-    const label maxIter = 120;
-    const scalar tol = 1e-12;
-
-    for (label it = 0; it < maxIter; ++it)
+    scalar lo = hi - 1;
+    while (logEndpointRatioMagnitude(lo, p, negativeEnd) > logTarget)
     {
-        const scalar m = 0.5*(a + b);
-        const scalar fm = gOf(m, alphaEff, alphaTarget);
+        lo -= max(scalar(1), mag(lo));
+    }
 
-        if (mag(fm) < tol || (b - a) < tol) return m;
-
-        if (fa*fm <= 0.0)
+    for (label iter = 0; iter < 100; ++iter)
+    {
+        const scalar mid = 0.5*(lo + hi);
+        if (logEndpointRatioMagnitude(mid, p, negativeEnd) < logTarget)
         {
-            b = m;
+            lo = mid;
         }
         else
         {
-            a = m;
-            fa = fm;
+            hi = mid;
         }
     }
 
-    return 0.5*(a + b);
-}
+    const scalar logEnd = 0.5*(lo + hi);
+    const scalar error =
+        logEndpointRatioMagnitude(logEnd, p, negativeEnd) - logTarget;
 
-scalar calcKhat(const scalar tStar, const scalar alphaEff)
-{
-    const scalar a2tStar = sqr(alphaEff)*tStar;
-    const scalar qStar = qOf(a2tStar);
-    const scalar denomKhat = sqr(alphaEff)*(1.0 - qStar);
-
-    if (mag(denomKhat) > VSMALL)
+    if (!std::isfinite(error) || mag(error) > sqrt(SMALL))
     {
-        return (1.0 + qStar)/denomKhat;
+        FatalErrorInFunction
+            << "Cannot resolve safeScaler damping for alpha = " << alpha
+            << exit(FatalError);
     }
-    return 0.0;
+
+    return negativeEnd ? -exp(logEnd) : exp(logEnd);
 }
 
 } // End anonymous namespace
@@ -253,52 +211,6 @@ tmp<volScalarField::Internal> sasRefineIndicator::makeTmpInternal
             init
         )
     );
-}
-
-sasRefineIndicator::optimizationCoeffs sasRefineIndicator::getOptimizationCoeffs
-(
-    const scalar weight,
-    const scalar alpha
-) const
-{
-    // Static cache to avoid recomputing tStar/Khat if weight/alpha don't change
-    static HashTable<optimizationCoeffs, word> cache(128);
-
-    // Create a unique key for the current parameters
-    const scalar qScale = 1e9;
-    const label wKey = label(round(weight*qScale));
-    const label aKey = label(round(alpha*qScale));
-    const word key(Foam::name(wKey) + "_" + Foam::name(aKey));
-
-    if (cache.found(key))
-    {
-        return cache[key];
-    }
-
-    // Calculate new coefficients
-    const scalar alphaEff = (alpha + weight)/(1.0 + weight);
-    
-    if (!(alphaEff > 0.0 && alphaEff < 1.0))
-    {
-        FatalErrorInFunction
-            << "Derived alphaEff must be in (0,1). Got " << alphaEff 
-            << " (alpha=" << alpha << ", weight=" << weight << ")."
-            << exit(FatalError);
-    }
-
-    optimizationCoeffs coeffs;
-    coeffs.tStar = solveTStar(alphaEff, alpha);
-    
-    if (!(coeffs.tStar > 0.0))
-    {
-        FatalErrorInFunction
-            << "Failed to determine a valid tStar." << exit(FatalError);
-    }
-
-    coeffs.Khat = calcKhat(coeffs.tStar, alphaEff);
-    
-    cache.insert(key, coeffs);
-    return coeffs;
 }
 
 tmp<volScalarField::Internal> sasRefineIndicator::markCoreBasic
@@ -428,14 +340,26 @@ sasRefineIndicator::markCoreSafeScaler
     const scalar alpha
 ) const
 {
-    if (alpha <= 0.0 || alpha > 1.0)
+    if (!std::isfinite(alpha) || alpha < 0)
     {
         FatalErrorInFunction
-            << "'alpha' must be in the range (0, 1] (got " << alpha << ")."
+            << "'alpha' must be finite and non-negative (got " << alpha << ")."
             << exit(FatalError);
     }
 
-    if (alpha == 1.0)
+    if
+    (
+        !std::isfinite(sigma) || sigma <= SMALL
+     || !std::isfinite(weight) || weight < 0
+    )
+    {
+        FatalErrorInFunction
+            << "safeScaler requires finite sigma > 0 and weight1 >= 0."
+            << exit(FatalError);
+    }
+
+    // Values below scalar precision have no distinguishable endpoint damping.
+    if (1 - alpha == 1)
     {
         return markCoreOddScaler(cells, c1, c2, weight, sigma);
     }
@@ -451,11 +375,11 @@ sasRefineIndicator::markCoreSafeScaler
     const volScalarField::Internal& d = td.ref();
 
     scalar dMaxLocal = -GREAT;
-    for (const label i : cells)
+    for (const label celli : cells)
     {
-        dMaxLocal = max(dMaxLocal, d[i]);
+        dMaxLocal = max(dMaxLocal, d[celli]);
     }
-    const scalar dMax = returnReduce(dMaxLocal, maxOp());
+    const scalar dMax = returnReduce(dMaxLocal, maxOp<scalar>());
 
     DebugInfo
         << "Calculated dMax = " << dMax << " for zone " << zone_ << nl;
@@ -465,47 +389,53 @@ sasRefineIndicator::markCoreSafeScaler
         return tG;
     }
 
-    // Retrieve mathematical constants (cached)
-    const optimizationCoeffs coeffs = getOptimizationCoeffs(weight, alpha);
-
-    // Calculate scaling factors
     const scalar shift = weight*dMax;
-    const scalar uMax  = max((1.0 + weight)*dMax, SMALL);
-    const scalar sigmaStar = uMax/max(sqrt(2.0*coeffs.tStar), SMALL);
-    const scalar kStar     = coeffs.Khat/sqr(uMax);
-    const scalar invTwoSigma2 = 0.5/sqr(sigmaStar);
+    const scalar uMax = dMax + shift;
+    const scalar invTwoSigma2 = 0.5/sqr(sigma);
+    const scalar endFactor = oneMinusExpNeg(sqr(uMax)*invTwoSigma2);
 
-    // 5. Apply scaler field-wise
+    if (!std::isfinite(uMax) || !(endFactor > 0))
+    {
+        FatalErrorInFunction
+            << "Cannot scale the oddScaler endpoint for zone " << zone_
+            << ". Check sigma, weight1 and the input field."
+            << exit(FatalError);
+    }
+
+    const scalar endpoint = dampingEndpoint(alpha);
+    scalar maxGLocal = 0;
+
     for (const label celli : cells)
     {
         const scalar u = d[celli] + shift;
+        const scalar b = d[celli] == dMax ? 1 :
+            (u/uMax)*oneMinusExpNeg(sqr(u)*invTwoSigma2)/endFactor;
 
-        // Base gaussian-like scaler
-        scalar y = u*oneMinusExpNeg(sqr(u)*invTwoSigma2);
-
-        // Apply damping denominator if u > 0
-        if (u > 0.0)
+        G[celli] = b;
+        if (b > 0)
         {
-            const scalar denom = 1.0 + kStar*sqr(u);
-            y = (denom > SMALL) ? (y / denom) : 0.0;
+            const scalar logPower = b < 1 ? 2*log(b)/alpha : 0;
+            const scalar power = exp(logPower);
+            // endpoint = 1-c. This form preserves precision near alpha=1
+            // when evaluating b*(1-c*b^p), with p=2/alpha.
+            G[celli] *= oneMinusExpNeg(-logPower) + endpoint*power;
         }
-
-        G[celli] = y;
+        maxGLocal = max(maxGLocal, G[celli]);
     }
 
-    // Normalise by maximum value of G for d > -shift
-    // const scalar maxG = gMax(G.primitiveField());
-    // for (const label i : cells)
-    // {
-    //     const scalar u = d[i] + shift;
-    //     const scalar Gi = G[i];
-    //     G[i] = (u > 0.0) ? Gi/maxG : Gi;
-    // }
-    // Normalise by maximum value of G
-    const scalar maxG = gMax(G.primitiveField());
-    if (maxG > SMALL)
+    const scalar maxG = returnReduce(maxGLocal, maxOp<scalar>());
+
+    if (!std::isfinite(maxG) || !(maxG > VSMALL))
     {
-        G /= maxG;
+        FatalErrorInFunction
+            << "safeScaler has no positive maximum in zone " << zone_
+            << " after damping; the field cannot be normalised."
+            << exit(FatalError);
+    }
+
+    for (const label celli : cells)
+    {
+        G[celli] /= maxG;
     }
 
     return tG;
@@ -718,6 +648,17 @@ bool sasRefineIndicator::read(const dictionary& dict)
             transferFunction_ = transferFunctionNames_.read(
                 dict.lookup("transferFunction")
             );
+
+            if
+            (
+                transferFunction_ == transferFunction::safeScaler
+             && (!std::isfinite(alpha_) || alpha_ < 0)
+            )
+            {
+                FatalIOErrorInFunction(dict)
+                    << "'alpha' must be finite and non-negative (got "
+                    << alpha_ << ")." << exit(FatalIOError);
+            }
 
             break;
         }
