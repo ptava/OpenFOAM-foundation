@@ -35,18 +35,12 @@ boundaryField
     }
     ground
     {
-        type            nutkAtmRoughWallFunction;
-        z0              uniform 0.0000181;
+        type            nutkWallFunction;
         value           uniform 0.0;
     }
     building
     {
-        type            nutkRoughWallFunction;
-        Cmu             0.09;
-        kappa           0.4;
-        E               9.8;
-        Cs              uniform 0.5;
-        Ks              uniform 0;
+        type            nutkWallFunction;
         value           uniform 0;
     }
 }
