@@ -1,0 +1,35 @@
+#!/bin/sh
+cd ${0%/*} || exit 1    # Run from this directory
+
+# Parse arguments for library compilation
+. $WM_PROJECT_DIR/wmake/scripts/AllwmakeParseArguments
+
+###--- src ---###
+
+# Modified turbulence model with additional cached terms
+wmake $targetType src/MomentumTransportModels/momentumTransportModels/RAS/kOmegaSSTSAS
+
+# Additional function objects for adaptive mesh refinement
+wmake $targetType src/functionObjects/field
+wmake $targetType src/functionObjects/utilities
+
+# Modified adaptive mesh refinement library
+wmake $targetType src/fvMeshTopoChangers
+
+# Modified finite volume library for timeVarying b.c.
+wmake $targetType src/finiteVolume
+
+# Modified atmospheric boundary layer library for boundary conditions and
+# porosity model
+wmake $targetType src/atmosphericModels
+
+# Modified sampling library
+wmake $targetType src/sampling
+
+###--- application ---###
+
+# Modified solver with additional diagnostics
+wmake $targetType applications/modules/incompressibleFluid
+
+
+#------------------------------------------------------------------------------

@@ -1,0 +1,166 @@
+// Include this fragment inside system/controlDict's functions dictionary.
+// Copy continuityDiagnostics into system/ and launch from the case directory.
+continuityBeforeAMR
+{
+    type            coded;
+    libs            ("libutilityFunctionObjects.so");
+    name            continuityBeforeAMR;
+    executeAtStart  true;
+    executeControl  timeStep;
+    executeInterval 1;
+    writeControl    writeTime;
+
+    codeInclude
+    #{
+        #include "fvMesh.H"
+        #include "volFields.H"
+        #include "surfaceFields.H"
+        #include "fviDiv.H"
+        #include "fvcDiv.H"
+        #include "Tuple2.H"
+        #include "IOdictionary.H"
+        #include <cmath>
+    #};
+
+    codeOptions
+    #{
+        -I$(LIB_SRC)/finiteVolume/lnInclude \
+        -I$(LIB_SRC)/meshTools/lnInclude
+    #};
+
+    codeLibs
+    #{
+        -lfiniteVolume \
+        -lmeshTools
+    #};
+
+    codeExecute
+    #{
+        const fvMesh& mesh = this->mesh();
+        const surfaceScalarField& phi =
+            mesh.lookupObject<surfaceScalarField>("phi");
+        if (phi.dimensions() != dimensions::volume/dimensions::time)
+        {
+            FatalErrorInFunction
+                << "Continuity diagnostics require volumetric phi"
+                << exit(FatalError);
+        }
+        const IOdictionary controls
+        (
+            IOobject
+            (
+                "continuityDiagnostics", mesh.time().system(), mesh,
+                IOobject::MUST_READ, IOobject::NO_WRITE, false
+            )
+        );
+        const scalar threshold = dimensionedScalar
+        (
+            "threshold", dimless/dimensions::time, controls
+        ).value();
+        if (!std::isfinite(threshold) || threshold < 0)
+        {
+            FatalIOErrorInFunction(controls)
+                << "threshold must be finite and non-negative"
+                << exit(FatalIOError);
+        }
+        const word stage("beforeAMR");
+        const volInternalScalarField residual(fvi::div(phi));
+        const scalarField& V = mesh.V();
+
+        bool invalid = false;
+        label cellsAbove = 0;
+        Tuple2<scalar, vector> maximum(-great, vector(Zero));
+
+        forAll(residual, celli)
+        {
+            const scalar magResidual = mag(residual[celli]);
+            invalid =
+                invalid
+             || !std::isfinite(magResidual)
+             || !std::isfinite(V[celli])
+             || V[celli] <= 0;
+
+            if (magResidual > maximum.first())
+            {
+                maximum.first() = magResidual;
+                maximum.second() = mesh.C()[celli];
+            }
+            if (magResidual > threshold)
+            {
+                ++cellsAbove;
+            }
+        }
+
+        reduce(invalid, orOp());
+        if (invalid)
+        {
+            FatalErrorInFunction
+                << "Nonfinite residual or invalid cell volume"
+                << exit(FatalError);
+        }
+
+        reduce
+        (
+            maximum,
+            [](const Tuple2<scalar, vector>& a, const Tuple2<scalar, vector>& b)
+            {
+                return a.first() >= b.first() ? a : b;
+            }
+        );
+        reduce(cellsAbove, sumOp());
+
+        if (maximum.first() < 0)
+        {
+            FatalErrorInFunction
+                << "Cannot compute continuity statistics on an empty mesh"
+                << exit(FatalError);
+        }
+
+        const scalar meanAbs =
+            weightedAverage(mag(residual), mesh.V()).value();
+        if (!std::isfinite(meanAbs))
+        {
+            FatalErrorInFunction
+                << "Nonfinite volume-average residual" << exit(FatalError);
+        }
+
+        Info<< "continuity stage=" << stage
+            << " cellsAbove=" << cellsAbove
+            << " maxAbs=" << maximum.first()
+            << " maxLocation=" << maximum.second()
+            << " volAverageAbs=" << meanAbs << endl;
+    #};
+
+    codeWrite
+    #{
+        const fvMesh& mesh = this->mesh();
+        const IOdictionary controls
+        (
+            IOobject
+            (
+                "continuityDiagnostics", mesh.time().system(), mesh,
+                IOobject::MUST_READ, IOobject::NO_WRITE, false
+            )
+        );
+        if (controls.lookupOrDefault<Switch>("writeResidual", false))
+        {
+            const surfaceScalarField& phi =
+                mesh.lookupObject<surfaceScalarField>("phi");
+            const volScalarField residual
+            (
+                IOobject
+                (
+                    "continuityResidual", mesh.time().name(), mesh,
+                    IOobject::NO_READ, IOobject::NO_WRITE, false
+                ),
+                fvc::div(phi)
+            );
+            if (!residual.write())
+            {
+                FatalErrorInFunction
+                    << "Failed to write continuityResidual"
+                    << exit(FatalError);
+            }
+        }
+    #};
+}

@@ -1,0 +1,13 @@
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      continuityDiagnostics;
+}
+
+// Shared by the coded baseline and correctPhi debug levels 1 and 2.
+threshold       [0 0 -1 0 0 0 0] 1e-6;
+
+// Baseline field output at normal case write times.
+// Statistics are always logged.
+writeResidual   false;

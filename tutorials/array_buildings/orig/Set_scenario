@@ -1,0 +1,318 @@
+#!/bin/bash
+###############################################################################
+# Set_scenario [--tag <tag>] [--folder <path-to-folder>] [--resources <path-to-resources>]
+#
+# - To be used in already prepared case folder.
+# - Define the case geometry/triSurface folder with stl files
+# - Copy scenario-related dictionaries
+# - <tag> cab be one of the following: H0, H1, H2
+#
+###############################################################################
+
+#--- Default --#
+TAG="H2"
+DIR="45deg"
+HEIGHT=0.2
+GEOMETRY_FOLDER="constant/geometry"
+DICTS_DIR="resources/dicts"
+STL_DIR="resources/geometry"
+DATA_DIR="resources/data"
+USER_DICT="system/userDict"
+CONTROL_DICT="system/controlDict"
+ACQ_START="2.0"
+ACQ_STOP="3.0"
+HF_STOP="3.0"
+ACQ_START2="4.2"
+ACQ_STOP2="5.2"
+HF_STOP2="5.2"
+LF_DT="0.05"
+HF_DT="0.01"
+
+#--- Source utility functions ---#
+. ./Util_functions || {
+    echo "Util_functions not found in current folder" >&2
+    return 1
+}
+
+usage() {
+    cat <<EOF
+    Usage: $0 [OPTIONS] --tag <tag>
+
+    Prepare case based on scenario selected by <tag>.
+
+    Options:
+        -g, --geom-tag <tag> Prepare case for the specified geometry scenario tag (H0, H1 or H2)
+        -d, --dir-tag <tag> Prepare case for the specific flow direction tag (0deg, 22deg, 45deg, from45to22)
+        -f, --folder <path-to-geometry-folder> Specify the folder to store stl files (default: constant/geometry)
+        --dicts-resources <path-to-dicts-folder> Specify the folder containing scenario-related dictionaries (default: resources/dicts)
+        --stl-resources <path-to-stl-folder> Specify the folder containing stl files (default: resources/geometry)
+        --data-resources <path-to-data-folder> Specify the folder containing initial and boundary conditions (default: resources/data)
+        --acq-start <time> Set averaging and acquisition start time
+        --acq-stop <time> Set averaging and low-frequency acquisition stop time
+        --hf-stop <time> Set high-frequency acquisition stop time
+        --acq-start2 <time> Set start time for the second from45to22 acquisition window
+        --acq-stop2 <time> Set stop time for the second from45to22 low-frequency acquisition window
+        --hf-stop2 <time> Set high-frequency stop time for the second from45to22 acquisition window
+        --lf-dt <time> Set low-frequency acquisition interval
+        --hf-dt <time> Set high-frequency acquisition interval
+        -h, --help  Show this help message and exit
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--geom-tag)
+                TAG="$2"
+                shift 2
+                ;;
+            -d|--dir-tag)
+                DIR="$2"
+                shift 2
+                ;;
+            -f|--folder)
+                GEOMETRY_FOLDER="$2"
+                shift 2
+                ;;
+            --dicts-resources)
+                DICTS_DIR="$2"
+                shift 2
+                ;;
+            --stl-resources)
+                STL_DIR="$2"
+                shift 2
+                ;;
+            --data-resources)
+                DATA_DIR="$2"
+                shift 2
+                ;;
+            --acq-start)
+                ACQ_START="$2"
+                shift 2
+                ;;
+            --acq-stop)
+                ACQ_STOP="$2"
+                shift 2
+                ;;
+            --hf-stop)
+                HF_STOP="$2"
+                shift 2
+                ;;
+            --acq-start2)
+                ACQ_START2="$2"
+                shift 2
+                ;;
+            --acq-stop2)
+                ACQ_STOP2="$2"
+                shift 2
+                ;;
+            --hf-stop2)
+                HF_STOP2="$2"
+                shift 2
+                ;;
+            --lf-dt)
+                LF_DT="$2"
+                shift 2
+                ;;
+            --hf-dt)
+                HF_DT="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1"
+                usage
+                return 1
+                ;;
+            *)
+                echo "Unknown parameter: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    # Sanity checks
+    if [[ ! -d "${DICTS_DIR}" ]]; then
+        echo "Error: Dicts folder '${DICTS_DIR}' does not exist." >&2
+        return 1
+    fi
+
+    if [[ ! -d "${STL_DIR}" ]]; then
+        echo "Error: Geometry folder '${STL_DIR}' does not exist." >&2
+        return 1
+    fi
+
+    if [[ ! -d "${DATA_DIR}" ]]; then
+        echo "Error: Data folder '${DATA_DIR}' does not exist." >&2
+        return 1
+    fi
+}
+
+set_acquisition_window() {
+    if ! command -v foamDictionary >/dev/null 2>&1; then
+        echo "Error: foamDictionary not found in PATH." >&2
+        return 1
+    fi
+
+    if [[ ! -f "${CONTROL_DICT}" ]]; then
+        echo "Error: Control dictionary '${CONTROL_DICT}' does not exist." >&2
+        return 1
+    fi
+
+    local simulation_end="${ACQ_STOP}"
+    if [[ "${DIR}" == "from45to22" ]]; then
+        simulation_end="${ACQ_STOP2}"
+    fi
+
+    foamDictionary -entry "endTime" -set "${simulation_end}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+
+    foamDictionary -entry "foStartAverage" -set "${ACQ_START}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    foamDictionary -entry "foLfStart" -set "${ACQ_START}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    foamDictionary -entry "foHfStart" -set "${ACQ_START}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+
+    foamDictionary -entry "foEndAverage" -set "${ACQ_STOP}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    foamDictionary -entry "foLfEnd" -set "${ACQ_STOP}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    foamDictionary -entry "foHfEnd" -set "${HF_STOP}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+
+    if [[ "${DIR}" == "from45to22" ]]; then
+        foamDictionary -entry "foStartAverage2" -set "${ACQ_START2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+        foamDictionary -entry "foLfStart2" -set "${ACQ_START2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+        foamDictionary -entry "foHfStart2" -set "${ACQ_START2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+
+        foamDictionary -entry "foEndAverage2" -set "${ACQ_STOP2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+        foamDictionary -entry "foLfEnd2" -set "${ACQ_STOP2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+        foamDictionary -entry "foHfEnd2" -set "${HF_STOP2}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    fi
+
+    foamDictionary -entry "foLfDeltaT" -set "${LF_DT}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+    foamDictionary -entry "foHfDeltaT" -set "${HF_DT}" "${CONTROL_DICT}" > /dev/null 2>&1 || return 1
+
+    echo "+--- Acquisition window set: endTime=${simulation_end}, lfDt=${LF_DT}, hfDt=${HF_DT}"
+    if [[ "${DIR}" == "from45to22" ]]; then
+        echo "+--- Primary window: start=${ACQ_START}, stop=${ACQ_STOP}, hfStop=${HF_STOP}"
+        echo "+--- Transition window: start=${ACQ_START2}, stop=${ACQ_STOP2}, hfStop=${HF_STOP2}"
+    else
+        echo "+--- Window: start=${ACQ_START}, stop=${ACQ_STOP}, hfStop=${HF_STOP}"
+    fi
+}
+
+set_geometries() {
+
+    # Copy geometry files to the specified folder
+    copy_file_if_exists "${STL_DIR}/BASE.stl" "${GEOMETRY_FOLDER}/."
+
+    case "${TAG}" in
+        H0)
+            echo "+--- Base stl file included"
+            ;;
+        H1)
+            copy_file_if_exists "${STL_DIR}/H1.stl" "${GEOMETRY_FOLDER}/."
+            echo "+--- H1 stl file included"
+            ;;
+        H2)
+            copy_file_if_exists "${STL_DIR}/H2.stl" "${GEOMETRY_FOLDER}/."
+            HEIGHT=0.4
+            echo "+--- H2 stl file included"
+            ;;
+        *)
+            echo "Error: Unknown scenario tag '${TAG}'. Supported tags are H0, H1, and H2." >&2
+            return 1
+    esac
+
+    # Copy scenario-related dictionaries
+    local surfaceFeaturesSource="${DICTS_DIR}/surfaceFeaturesDict_${TAG}"
+    local snappyHexSource="${DICTS_DIR}/snappyHexMeshDict_${TAG}"
+    local snappyHexTarget="system/snappyHexMeshDict"
+    local surfaceFeaturesTarget="system/surfaceFeaturesDict"
+    copy_file_if_exists "$snappyHexSource" "$snappyHexTarget"
+    copy_file_if_exists "$surfaceFeaturesSource" "$surfaceFeaturesTarget"
+
+    # Copy scenario-related initial conditions
+    local dataTag="${DIR}"
+    if [[ "${DIR}" == "from45to22" ]]; then
+        dataTag="from45to22"
+    fi
+
+    local dataSource="${DATA_DIR}/boundaryData_${dataTag}"
+    local dataTarget="constant/boundaryData"
+
+    if [[ ! -d "${dataSource}" ]]; then
+        if [[ "${DIR}" == "from45to22" ]]; then
+            echo "Error: '${dataSource}' is required for the 45deg-to-22deg transition case." >&2
+            echo "Create the composite boundaryData set before using '--dir-tag from45to22'." >&2
+        else
+            echo "Error: Data folder '${dataSource}' does not exist." >&2
+        fi
+        return 1
+    fi
+
+    cp -r "${dataSource}" "${dataTarget}" || {
+        echo "Error: Failed to copy boundary data from '${dataSource}' to '${dataTarget}'." >&2
+        return 1
+    }
+
+    echo "+--- Scenario-related dictionaries included"
+}
+
+change_domain() {
+    if ! command -v foamDictionary >/dev/null 2>&1; then
+        echo "Error: foamDictionary not found in PATH." >&2
+        return 1
+    fi
+
+    blockMeshDict_target="system/blockMeshDict"
+
+    echo "+--- Setting computational domain: this will affect user dictionary"
+
+    foamDictionary -entry scenario/flowDirection -set "${DIR}" "${USER_DICT}"
+
+    case "${DIR}" in
+        0deg)
+            blockMeshDict_source="${DICTS_DIR}/blockMeshDict_parallel"
+            copy_file_if_exists "${blockMeshDict_source}" "${blockMeshDict_target}"
+
+            foamDictionary -entry background/max_x -set 3.4 "${USER_DICT}"
+            foamDictionary -entry background/max_y -set 1.4 "${USER_DICT}"
+            foamDictionary -entry refinement/r1/max_y -set 0.9 "${USER_DICT}"
+
+            echo "+--- Computational domain set for 0deg inflow direction"
+            ;;
+        22deg)
+            blockMeshDict_source="${DICTS_DIR}/blockMeshDict_notParallel"
+            copy_file_if_exists "${blockMeshDict_source}" "${blockMeshDict_target}"
+
+            foamDictionary -entry background/max_x -set 3.2 "${USER_DICT}"
+            foamDictionary -entry background/max_y -set 2.8 "${USER_DICT}"
+            foamDictionary -entry refinement/r1/max_y -set 1.2 "${USER_DICT}"
+
+            echo "+--- Computational domain set for 22deg inflow direction"
+            ;;
+        45deg|from45to22)
+            blockMeshDict_source="${DICTS_DIR}/blockMeshDict_notParallel"
+            copy_file_if_exists "${blockMeshDict_source}" "${blockMeshDict_target}"
+
+            if [[ "${DIR}" == "from45to22" ]]; then
+                echo "+--- Computational domain set for the 45deg-based from45to22 transition"
+            else
+                echo "+--- Computational domain set for 45deg inflow direction"
+            fi
+            ;;
+        *)
+            echo "Error: Unknown direction tag '${DIR}'. Supported tags are 0deg, 22deg, 45deg, and from45to22." >&2
+            return 1
+            ;;
+    esac
+}
+
+#--- Entry point ---#
+set_scenario() {
+    parse_args "$@"
+    echo "Preparing test case for scenario '${TAG}'-'${DIR}'..."
+    set_geometries
+    change_domain
+    set_acquisition_window
+    echo "Completed setting up the scenario '${TAG}'-'${DIR}'."
+}

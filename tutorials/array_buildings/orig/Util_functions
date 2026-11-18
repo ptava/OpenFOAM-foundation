@@ -1,0 +1,471 @@
+#!/bin/bash
+###############################################################################
+# set_acquisition_time 
+#   <Δt> <startTime> <endTime> path/to/foDir [protected‑file ...]
+#
+# • Updates system/controlDict:
+#       endTime        ← <endTime>
+#       writeInterval  ← <endTime>
+# • Updates every Function Object:
+#       timeStart|startTime     ← <startTime>
+#       timeEnd|endTime         ← <endTime>
+#   …and, unless the FO file is listed in the “protected” arguments…
+#       executeInterval ← <Δt>
+#       writeInterval   ← <Δt>
+#
+# Any extra arguments (4‑N) are treated as **basenames** of FO files that must
+# keep their original execute/write intervals.
+###############################################################################
+set_acquisition_time() {
+    local acquisition_dt="$1"       # acquisition delta time
+    local start_time="$2"           # start acquisition time
+    local end_time="$3"             # end simulation and acquisition time
+    local fo_dir="$4"               # function objects directory
+    local -a protected=("${@:5}")   # remaining args as array of protected files
+
+    local control_dict="system/controlDict"
+    local fo_dir="system/function_objects"
+
+    #--- sanity checks ---#
+    [[ -f $control_dict ]] || { echo "Error: ${control_dict} not found" >&2; return 1; }
+    [[ -d $fo_dir       ]] || { echo "Error: ${fo_dir} directory not found" >&2; return 1; }
+
+    #--- 1. patch controlDict ---#
+    sed -Ei "
+        s/(^[[:space:]]*endTime[[:space:]]+).*/\1${end_time};/;
+        s/(^[[:space:]]*writeInterval[[:space:]]+).*/\1${end_time};/
+    " "$control_dict"
+
+    #--- 2. patch each Function Object file ---#
+    mapfile -d '' -t fo_files < <(find "$fo_dir" -type f -print0)
+
+    for fo in "${fo_files[@]}"; do
+        if [[ ! " ${protected[*]} " =~ " $(basename "$fo") " ]]; then
+            sed -Ei "
+                s/(^[[:space:]]*(timeStart|startTime)[[:space:]]+).*/\1${start_time};/;
+                s/(^[[:space:]]*(timeEnd|endTime)[[:space:]]+).*/\1${end_time};/
+            " "$fo"
+            sed -Ei "
+                s/(^[[:space:]]*executeInterval[[:space:]]+).*/\1${acquisition_dt};/;
+                s/(^[[:space:]]*writeInterval[[:space:]]+).*/\1${acquisition_dt};/
+            " "$fo"
+        fi
+    done
+}
+
+###############################################################################
+# copy_file_if_exists <source> <destination>
+#
+# • Copies <source> to <destination> **only** if <source> is a regular file.
+# • Check if directory tree exist.
+# • Preserves timestamps and permissions (cp -p).
+###############################################################################
+copy_file_if_exists() {
+    local src="$1"
+    local dst="$2"
+
+    if [[ -z $src || -z $dst ]]; then
+        echo "Usage: copy_file_if_exists <source> <destination>" >&2
+        return 1
+    fi
+
+    if [[ ! -f $src ]]; then
+        echo "Warning: $(basename -- "$src") not found – skipping." >&2
+        return 0
+    fi
+
+    local dst_dir
+    dst_dir=$(dirname "$dst")
+    if [[ ! -d $dst_dir ]]; then
+        echo "Error: could not find $dst_dir" >&2
+        return 1
+    fi
+
+    echo "Copying $src → $dst"
+    cp -p "$src" "$dst"
+}
+
+###############################################################################
+# set_scaling <scale> [<file1> <file2> …]
+#
+# • Sets the scaling factor for the given files.
+# • The scaling factor is set as "cells_scaling" in the files.
+#
+#################################################################################
+set_scaling() {
+    local scale="$1"
+    shift
+    local files=("$@")
+
+    #--- sanity: need at least one argument ---#
+    if [[ -z $scale || ${#files[@]} -eq 0 ]]; then
+        echo "Usage: set_scaling <scale> [<file1> <file2> …]" >&2
+        return 1
+    fi
+
+    #--- set scaling factor in each file ---#
+    for file in "${files[@]}"; do
+        if [[ -f $file ]]; then
+            if grep -q "cells_scaling" "$file"; then
+                sed -Ei "s/(cells_scaling[[:space:]]+).*/\1$scale;/" "$file"
+            else
+                echo "Warning: 'cells_scaling' not found in $(basename -- "$file") - skipping." >&2
+            fi
+        else
+            echo "Warning: $(basename -- "$file") not found – skipping." >&2
+        fi
+    done
+}
+
+###############################################################################
+# set_parallel <n_procs> <dictionary>
+#
+# • Sets the number of processsors in dictionary
+#
+#################################################################################
+set_parallel() {
+    local n_proc="$1"
+    local file="$2"
+
+    #--- sanity checks
+    if [[ -z "${n_proc}" || -z "${file}" ]]; then
+        echo "Usage: set_parallel <n_proc> <dictionary>" >&2
+        return 1
+    fi
+
+    #--- set number of processors --#
+    sed -Ei "s/(numberOfSubdomains[[:space:]]+).*/\1$n_proc;/" "$file"
+}
+
+###############################################################################
+# set_fos <FOsDir> <path-to-file>
+#
+# • Adds all FOs in the directory to system/controlDict/functions.
+# • FOs are sorted by the number at the end of their filename.
+# • The FOs are included in the controlDict by inserting 'functions'
+#   dictionary at the second-to-last line of the controlDict file.
+# • Function object naming supports the following pattern:
+#      FO_<name>_<number>
+#      where <number> is an integer or a floating point number.
+#
+###############################################################################
+set_fos() {
+    local fo_name_pattern="^FO_.*_([0-9]+\.?[0-9]*)"
+    local fo_dir="$1"
+    local functions_file="$2"
+
+    #--- sanity checks ---#
+    if [[ -z $fo_dir || ! -d $fo_dir ]]; then
+        echo "Usage: setFOs <FOsDir> and ${fo_dir} must exist" >&2
+        return 1
+    fi
+
+    if [[ ! -f $functions_file ]]; then
+        echo "Error: ${functions_file} not found in system folder" >&2
+        return 1
+    fi
+
+    #--- add FOs to controlDict in a sorted order ---#
+    local fo_files
+    mapfile -d '' -t fo_files < <(find "$fo_dir" -maxdepth 1 -type f -print0)
+
+    IFS=$'\n' readarray -t sorted_fo_files < <(
+      for f in "${fo_files[@]}"; do
+        filename=$(basename "$f")
+        if [[ $filename =~ $fo_name_pattern ]]; then
+            printf "%s\t%s\n" "${BASH_REMATCH[1]}" "$f"
+        fi
+      done | LC_ALL=C sort -t $'\t' -k1,1V | cut -f2-
+    )
+
+    # Build the block to insert
+    fo_block=""
+    echo "Adding Function Objects:"
+
+    for fo in "${sorted_fo_files[@]}"; do
+        echo -e "\t⇲ $(basename "$fo")"
+        fo_block+="\t#include \"./"$fo"\"\n"
+    done
+    
+    if [[ $(basename "${functions_file}") == "controlDict" ]]; then
+        fo_block="functions {\n${fo_block}}"
+    fi
+
+    # Insert the block before the last line of controlDict
+    tmp_file=$(mktemp)
+    total_lines=$(wc -l < "$functions_file")
+    insert_line=$((total_lines - 1))
+    head -n "$insert_line" "$functions_file" > "$tmp_file"
+    echo -e "$fo_block" >> "$tmp_file"
+    tail -n 1 "$functions_file" >> "$tmp_file"
+
+    # Overwrite original controlDict
+    mv "$tmp_file" "$functions_file"
+}
+
+###############################################################################
+# set_fo_states <common-state> <path-to-function-object>
+#
+# • Updates 'enabled' flag for all functions defined within the given function
+#   object file.
+# • Uses foamDictionary
+#
+###############################################################################
+set_fo_states() {
+    local enabled="$1"
+    local function_object_file="$2"
+    local action="Updating"
+
+    if [[ -z "${enabled}" || -z "${function_object_file}" ]]; then
+        echo "Usage: set_fo_states <on|off|true|false|1|0> " \
+            "<path-to-function-object>" >&2
+        return 2
+    fi
+
+    if [[ ! -f "${function_object_file}" ]]; then
+        echo "Error: File '$function_object_file' not found" >&2
+        return 1
+    fi
+
+    if ! command -v foamDictionary >/dev/null 2>&1; then
+        echo "Error: foamDictionary not found in PATH." >&2
+        return 1
+    fi
+
+    case "${enabled}" in
+        on|true|yes|1)
+            action="Enabling"
+            ;;
+        off|false|no|0)
+            action="Disabling"
+            ;;
+    esac
+
+    for dictionary in $(foamDictionary -keywords "${function_object_file}"); do
+        foamDictionary -entry ${dictionary}/enabled \
+            -set "${enabled}" \
+            "${function_object_file}" > /dev/null 2>&1
+        echo "${action} '${dictionary}' in '$(basename "${function_object_file}")'"
+    done
+}
+
+###############################################################################
+# check_resources [--resources <path-to-resources>]
+#
+# - To be used in already prepared case folder.
+# - Check if case folder has been prepared with required resources folders:
+#
+#     <path-to-resources>
+#     |
+#     +-- dicts
+#     +-- data
+#     +-- geometry
+#     +-- properties
+#     +-- function_objects
+#
+# Outputs:
+#  - Exits with an error if any of the required folders are missing.
+#  - Returns folders paths
+#
+###############################################################################
+check_resources() {
+    local resources_dir="resources"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--resources)
+                if [[ -d "$2" ]]; then
+                    resources_dir="$2"
+                    shift 2
+                else
+                    echo "Error: Resources directory '$2' does not exist." >&2
+                    return 1
+                fi
+                ;;
+            -*)
+                echo "Unknown option: $1"
+                usage
+                return 1
+                ;;
+            *)
+                echo "Unknown parameter: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    dicts_dir="${resources_dir}/dicts"
+    data_dir="${resources_dir}/data"
+    geometry_dir="${resources_dir}/geometry"
+    properties_dir="${resources_dir}/properties"
+    functions_dir="${resources_dir}/function_objects"
+
+    # Sanity checks
+    require_dirs=(
+        "${dicts_dir}"
+        "${data_dir}"
+        "${geometry_dir}"
+        "${properties_dir}"
+        "${functions_dir}"
+    )
+    for dir in "${require_dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            echo "Error: Required directory '$dir' does not exist." >&2
+            return 1
+        fi
+    done
+
+    echo ${dicts_dir} ${data_dir} ${geometry_dir} ${properties_dir} ${functions_dir}
+
+}
+
+###############################################################################
+# check_if_empty <directory>
+#
+# - Checks if the specified directory is empty.
+#
+# Outputs:
+#  - Exits with an error if the directory does not exist or is not empty.
+# #############################################################################
+check_if_empty() {
+    local dir="$1"
+
+    if [[ ! -d "$dir" ]]; then
+        echo "Error: Directory '$dir' does not exist." >&2
+        return 1
+    fi
+
+    if [[ ! -z "$(ls -A "$dir")" ]]; then
+        echo "Warning: Directory '$dir' is not empty." >&2
+    fi
+}
+
+###############################################################################
+# set_lib <token> <dictionary>
+#
+# • Inserts the given token into the libs(...) block of dictionary
+# • Works with inline and multiline libs(...) blocks
+# • If the token already exists, does nothing and prints a message
+#
+###############################################################################
+
+set_lib() {
+    local tok="$1"
+    local file="$2"
+    local escaped_tok=""
+
+    if [[ -z "$tok" || -z "$file" || ! -f "$file" || ! -w "$file" ]]; then
+        echo "Usage: set_lib <token> <dictionary> (file must exist and be writable)" >&2
+        return 1
+    fi
+
+    escaped_tok=$(printf '%s\n' "$tok" | sed 's/[][(){}.^$*+?|\\/]/\\&/g')
+
+    # INLINE form: libs ( banana pinto );
+    if grep -qE '^[[:space:]]*libs[[:space:]]*\([^)]*\);' "$file"; then
+        if grep -qE "^[[:space:]]*libs[[:space:]]*\([^)]*\"${escaped_tok}\"[^)]*\);" \
+            "$file"; then
+            echo "Token '$tok' already present (inline)." >&2
+            return 0
+        fi
+        sed -E -i \
+            "s/^([[:space:]]*libs[[:space:]]*\([^)]*)\);/\1 \"$tok\");/" "$file"
+        echo "Inserting '$tok' into inline libs(...)."
+        return 0
+    fi
+
+    # MULTILINE form
+    if grep -qE '^[[:space:]]*libs[[:space:]]*\($' "$file"; then
+        if sed -nE "/^[[:space:]]*libs[[:space:]]*\($/,/^[[:space:]]*\);/p" \
+            "$file" | grep -qE "^[[:space:]]*\"${escaped_tok}\"[[:space:]]*$"; then
+            echo "Token '$tok' already present (multiline)." >&2
+            return 0
+        fi
+
+        # detect indentation of first entry, fallback to 2 spaces
+        local indent
+        indent=$(sed -nE \
+            "/^[[:space:]]*libs[[:space:]]*\($/{n;s/^([[:space:]]*).*/\1/p;q}" \
+            "$file")
+        [[ -z "$indent" ]] && indent="  "
+
+        sed -E -i \
+            "/^[[:space:]]*libs[[:space:]]*\($/,/^[[:space:]]*\);/{
+                /^[[:space:]]*\);/ i\\
+${indent}\"${tok}\"
+            }" "$file"
+        echo "Inserting '$tok' into multiline libs(...)."
+        return 0
+    fi
+
+    echo "No libs(...) block found in '$file'." >&2
+    return 1
+}
+
+###############################################################################
+# set_turbulence_model <model> <dictFile>
+#
+# • Updates the given dictionary (e.g., constant/turbulenceProperties):
+#
+###############################################################################
+set_turbulence_model() {
+    local new_model="$1"
+    local dict_file="$2"
+
+    if [[ ! -f "$dict_file" ]]; then
+        echo "Error: File '$dict_file' not found" >&2
+        return 1
+    fi
+
+    # Replace the RASModel line with the new model
+    sed -i -E "s|^( *RASModel[[:space:]]+).*;|\1${new_model};|" "$dict_file"
+}
+
+###############################################################################
+# postprocess <single-simulation>
+# Postprocess the given setup
+# run external python package for post-processing
+# package name: postProcess4Validation
+# look at github.com/ptava/postprocess4validation.git
+#
+# Outputs:
+#    Writes into 'results' folder
+###############################################################################
+postprocess() {
+    local single_simulation=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--single-case)
+                if [[ -d "$2" ]]; then
+                    path_to_postprocessing="$2"
+                    single_simulation="--single ${path_to_postprocessing}"
+                fi
+                shift 2
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                echo "Unknown parameter: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    command -v quantitative-cli >/dev/null 2>&1 || { echo "quantitative-cli not found. Please install postProcess4Validation package." >&2; return 127; }
+    command -v qualitative-cli >/dev/null 2>&1 || { echo "qualitative-cli not found. Please install postProcess4Validation package." >&2; return 127; }
+
+    quantitative-cli \
+        --exp-data resources/data/expData.csv \
+        --output-dir results/quantitative \
+        --save-only \
+        ${single_simulation}
+
+    qualitative-cli \
+        --exp-data resources/data/expData.csv \
+        --output-dir results/qualitative \
+        --save-only \
+        ${single_simulation}
+}

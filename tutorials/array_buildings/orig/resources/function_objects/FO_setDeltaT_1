@@ -1,0 +1,29 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2412                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+
+setDeltaT
+{
+    libs            ("libutilityFunctionObjects.so");
+    type            setTimeStep;
+    enabled         true;
+
+    deltaT
+    {
+        type            table;
+        values
+        (
+            (0.25       1e-3)
+            (1.9        5e-5)
+        );
+        interpolationScheme     linear;
+        outOfBounds     clamp;
+    }
+}
+
+
+// ************************************************************************* //

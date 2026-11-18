@@ -1,0 +1,5 @@
+myincompressibleFluid.C
+mymoveMesh.C
+myContinuityOutput.C
+
+LIB = $(FOAM_USER_LIBBIN)/libmyincompressibleFluidSolver
