@@ -379,7 +379,7 @@ sasRefineIndicator::markCoreSafeScaler
     {
         dMaxLocal = max(dMaxLocal, d[celli]);
     }
-    const scalar dMax = returnReduce(dMaxLocal, maxOp<scalar>());
+    const scalar dMax = returnReduce(dMaxLocal, maxOp());
 
     DebugInfo
         << "Calculated dMax = " << dMax << " for zone " << zone_ << nl;
@@ -414,7 +414,7 @@ sasRefineIndicator::markCoreSafeScaler
         G[celli] = b;
         if (b > 0)
         {
-            const scalar logPower = b < 1 ? 2*log(b)/alpha : 0;
+            const scalar logPower = b < 1 ? 2*Foam::log(b)/alpha : 0;
             const scalar power = exp(logPower);
             // endpoint = 1-c. This form preserves precision near alpha=1
             // when evaluating b*(1-c*b^p), with p=2/alpha.
@@ -423,7 +423,7 @@ sasRefineIndicator::markCoreSafeScaler
         maxGLocal = max(maxGLocal, G[celli]);
     }
 
-    const scalar maxG = returnReduce(maxGLocal, maxOp<scalar>());
+    const scalar maxG = returnReduce(maxGLocal, maxOp());
 
     if (!std::isfinite(maxG) || !(maxG > VSMALL))
     {
