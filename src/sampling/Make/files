@@ -1,0 +1,4 @@
+probes/myprobes.C
+probes/myprobesGrouping.C
+
+LIB = $(FOAM_USER_LIBBIN)/libmysampling
