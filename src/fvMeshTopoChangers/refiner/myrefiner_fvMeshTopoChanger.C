@@ -1,0 +1,2227 @@
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+     \\/     M anipulation  |
+-------------------------------------------------------------------------------
+License
+    This file is part of OpenFOAM.
+
+    OpenFOAM is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+
+\*---------------------------------------------------------------------------*/
+
+#include "myrefiner_fvMeshTopoChanger.H"
+#include "surfaceInterpolate.H"
+#include "polyTopoChange.H"
+#include "syncTools.H"
+#include "pointFields.H"
+#include "sigFpe.H"
+#include "cellSet.H"
+#include "addToRunTimeSelectionTable.H"
+#include "ListListOps.H"
+#include "globalIndex.H"
+#include "uniformDimensionedFields.H"
+#include "clockTime.H"
+
+
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+namespace Foam
+{
+namespace fvMeshTopoChangers
+{
+    defineTypeNameAndDebug(myrefiner, 0);
+    addToRunTimeSelectionTable(fvMeshTopoChanger, myrefiner, fvMesh);
+}
+}
+
+
+// * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * * //
+
+void Foam::fvMeshTopoChangers::myrefiner::makeDumpField
+(
+    autoPtr<volScalarField>& fld,
+    const word& name
+) const
+{
+    const bool needCreate = !fld.valid() || (fld->mesh().size() != this->mesh().nCells());
+
+    if (!needCreate) return;
+
+    fld.reset
+    (
+        new volScalarField
+        (
+            IOobject
+            (
+                name,
+                this->mesh().time().name(),
+                this->mesh(),
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            this->mesh(),
+            dimensionedScalar(dimless, Zero)
+        )
+    );
+}
+
+void Foam::fvMeshTopoChangers::myrefiner::resetDumpInfo()
+{
+    if (!dumpRefinementInfo_)
+    {
+        return;
+    }
+
+    const scalar nan = std::numeric_limits<scalar>::quiet_NaN();
+
+    setInfo("nTotToRefine", 0);
+    setInfo("nCandidates", 0);
+    setInfo("nSelected", 0);
+    setInfo("nTotRefined", 0);
+    setInfo("upperLimit", nan);
+    setInfo("lowerLimit", nan);
+}
+
+Foam::label Foam::fvMeshTopoChangers::myrefiner::currentMaxCells
+(
+    const label initialCells
+) const
+{
+    const scalar rawMaxCells = maxCells_->value(mesh().time().value());
+
+    if (rawMaxCells < initialCells)
+    {
+        FatalIOErrorInFunction(dict_)
+            << "maxCells must evaluate to at least the initial global cell count "
+            << initialCells << nl
+            << "    Time: " << mesh().time().value() << nl
+            << "    Current value: " << rawMaxCells << nl
+            << exit(FatalIOError);
+    }
+
+    const label maxCells = label(rawMaxCells);
+
+    DebugInfo
+        << "maxCells at time " << mesh().time().value()
+        << " = " << maxCells << endl;
+
+    return maxCells;
+}
+
+
+Foam::label Foam::fvMeshTopoChangers::myrefiner::currentRefineInterval() const
+{
+    const scalar rawInterval =
+        refineInterval_->value(mesh().time().value());
+
+    if (rawInterval < 0)
+    {
+        FatalErrorInFunction
+            << "refineInterval must evaluate to a non-negative value" << nl
+            << "    Time: " << mesh().time().value() << nl
+            << "    Current value: " << rawInterval << nl
+            << abort(FatalError);
+    }
+
+    // Function1 returns a scalar; use the nearest integer time-step interval.
+    const scalar roundedInterval = round(rawInterval);
+
+    if (debug && mag(rawInterval - roundedInterval) > SMALL)
+    {
+        Info<< "refineInterval value " << rawInterval
+            << " rounded to " << label(roundedInterval)
+            << " at time " << mesh().time().value() << endl;
+    }
+
+    return label(roundedInterval);
+}
+
+
+Foam::label Foam::fvMeshTopoChangers::myrefiner::count
+(
+    const PackedBoolList& l,
+    const unsigned int val
+)
+{
+    label n = 0;
+    forAll(l, i)
+    {
+        if (l.get(i) == val)
+        {
+            n++;
+        }
+    }
+
+    return n;
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::calculateProtectedCells
+(
+    PackedBoolList& unrefineableCells
+) const
+{
+    if (protectedCells_.empty())
+    {
+        unrefineableCells.clear();
+        return;
+    }
+
+    const labelList& cellLevel = meshCutter_.cellLevel();
+
+    unrefineableCells = protectedCells_;
+
+    // Get neighbouring cell level
+    labelList neiLevel(mesh().nFaces() - mesh().nInternalFaces());
+
+    for
+    (
+        label facei = mesh().nInternalFaces();
+        facei < mesh().nFaces();
+        facei++
+    )
+    {
+        neiLevel[facei - mesh().nInternalFaces()] =
+            cellLevel[mesh().faceOwner()[facei]];
+    }
+    syncTools::swapBoundaryFaceList(mesh(), neiLevel);
+
+
+    while (true)
+    {
+        // Pick up faces on border of protected cells
+        boolList seedFace(mesh().nFaces(), false);
+
+        forAll(mesh().faceNeighbour(), facei)
+        {
+            const label own = mesh().faceOwner()[facei];
+            const bool ownProtected = unrefineableCells.get(own);
+            const label nei = mesh().faceNeighbour()[facei];
+            const bool neiProtected = unrefineableCells.get(nei);
+
+            if (ownProtected && (cellLevel[nei] > cellLevel[own]))
+            {
+                seedFace[facei] = true;
+            }
+            else if (neiProtected && (cellLevel[own] > cellLevel[nei]))
+            {
+                seedFace[facei] = true;
+            }
+        }
+
+        for
+        (
+            label facei = mesh().nInternalFaces();
+            facei < mesh().nFaces();
+            facei++
+        )
+        {
+            const label own = mesh().faceOwner()[facei];
+            const bool ownProtected = unrefineableCells.get(own);
+
+            if
+            (
+                ownProtected
+             && (neiLevel[facei-mesh().nInternalFaces()] > cellLevel[own])
+            )
+            {
+                seedFace[facei] = true;
+            }
+        }
+
+        syncTools::syncFaceList(mesh(), seedFace, orEqOp());
+
+
+        // Extend unrefineableCells
+        bool hasExtended = false;
+
+        for (label facei = 0; facei < mesh().nInternalFaces(); facei++)
+        {
+            if (seedFace[facei])
+            {
+                const label own = mesh().faceOwner()[facei];
+                if (unrefineableCells.get(own) == 0)
+                {
+                    unrefineableCells.set(own, 1);
+                    hasExtended = true;
+                }
+
+                const label nei = mesh().faceNeighbour()[facei];
+                if (unrefineableCells.get(nei) == 0)
+                {
+                    unrefineableCells.set(nei, 1);
+                    hasExtended = true;
+                }
+            }
+        }
+
+        for
+        (
+            label facei = mesh().nInternalFaces();
+            facei < mesh().nFaces();
+            facei++
+        )
+        {
+            if (seedFace[facei])
+            {
+                const label own = mesh().faceOwner()[facei];
+
+                if (unrefineableCells.get(own) == 0)
+                {
+                    unrefineableCells.set(own, 1);
+                    hasExtended = true;
+                }
+            }
+        }
+
+        if (!returnReduce(hasExtended, orOp()))
+        {
+            break;
+        }
+    }
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::readDict()
+{
+    refineInterval_.reset
+    (
+        Function1<scalar>::New("refineInterval", dimTime, dimless, dict_).ptr()
+    );
+
+    unrefineInterval_ =
+        dict_.lookupOrDefault<label>("unrefineInterval", 1);
+
+    maxCells_.reset
+    (
+        Function1<scalar>::New("maxCells", dimTime, dimless, dict_).ptr()
+    );
+    currentMaxCells(initialCells_);
+
+    nBufferLayers_ = dict_.lookup<label>("nBufferLayers");
+
+    if (dict_.found("correctFluxes"))
+    {
+        const List<Pair<word>> fluxVelocities = List<Pair<word>>
+        (
+            dict_.lookup("correctFluxes")
+        );
+
+        // Rework into hashtable.
+        correctFluxes_.resize(fluxVelocities.size());
+        forAll(fluxVelocities, i)
+        {
+            correctFluxes_.insert(fluxVelocities[i][0], fluxVelocities[i][1]);
+        }
+    }
+
+    dumpLevel_ = Switch(dict_.lookup("dumpLevel"));
+    dumpRefinementInfo_ = dict_.lookupOrDefault<bool>("dumpRefinementInfo", false);
+    dumpRefinementFields_ =
+        dict_.lookupOrDefault<bool>("dumpRefinementFields", false);
+    dumpProtectedCells_ =
+        dict_.lookupOrDefault<bool>("dumpProtectedCells", false);
+    rebuildProtectedCells_ =
+        dict_.lookupOrDefault<bool>("rebuildProtectedCells", false);
+    if (dumpRefinementFields_)
+    {
+        makeDumpField(cellError_, "cellError");
+    }
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::buildProtectedCells() const
+{
+    const fvMesh& mesh = this->mesh();
+    const labelList& cellLevel = meshCutter_.cellLevel();
+    const labelList& pointLevel = meshCutter_.pointLevel();
+
+    protectedCells_.clear();
+    protectedCells_.setSize(mesh.nCells());
+
+    label nProtected = 0;
+
+    // Count number of points <= cellLevel
+    labelList nAnchors(mesh.nCells(), 0);
+
+    forAll(mesh.pointCells(), pointi)
+    {
+        const labelList& pCells = mesh.pointCells()[pointi];
+
+        forAll(pCells, i)
+        {
+            const label celli = pCells[i];
+
+            if (!protectedCells_.get(celli))
+            {
+                if (pointLevel[pointi] <= cellLevel[celli])
+                {
+                    nAnchors[celli]++;
+
+                    if (nAnchors[celli] > 8)
+                    {
+                        if (protectedCells_.set(celli,1))
+                        {
+                            nProtected++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check cell-side face anchor admissibility
+    forAll(mesh.cells(), celli)
+    {
+        if (protectedCells_.get(celli))
+        {
+            continue;
+        }
+
+        const cell& cFaces = mesh.cells()[celli];
+        const label cLevel = cellLevel[celli];
+
+        forAll(cFaces, cFacei)
+        {
+            const label facei = cFaces[cFacei];
+            const face& f = mesh.faces()[facei];
+
+            label nFaceAnchors = 0;
+
+            forAll(f, fp)
+            {
+                if (pointLevel[f[fp]] <= cLevel)
+                {
+                    nFaceAnchors++;
+                }
+            }
+
+            if (nFaceAnchors != 1 && nFaceAnchors != 4)
+            {
+                if (protectedCells_.set(celli, 1))
+                {
+                    nProtected++;
+                }
+                break;
+            }
+        }
+    }
+
+    // Also protect any cells that are less than hex
+    forAll(mesh.cells(), celli)
+    {
+        const cell& cFaces = mesh.cells()[celli];
+
+        if (cFaces.size() < 6)
+        {
+            if (protectedCells_.set(celli, 1))
+            {
+                nProtected++;
+            }
+        }
+        else
+        {
+            forAll(cFaces, cFacei)
+            {
+                if (mesh.faces()[cFaces[cFacei]].size() < 4)
+                {
+                    if (protectedCells_.set(celli, 1))
+                    {
+                        nProtected++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Check cells for 8 corner points
+    checkEightAnchorPoints(protectedCells_, nProtected);
+
+    const label nTotProtected = returnReduce(nProtected, sumOp());
+    if (nTotProtected == 0)
+    {
+        protectedCells_.clear();
+    }
+    else
+    {
+        Info<< "Detected "
+            << nTotProtected
+            << " cells that are protected from refinement" << endl;
+
+        if (dumpProtectedCells_)
+        {
+            cellSet protectedCells(mesh, "protectedCells", nProtected);
+            forAll(protectedCells_, celli)
+            {
+                if (protectedCells_[celli])
+                {
+                    protectedCells.insert(celli);
+                }
+            }
+            Info<< " Writing cellSet " << protectedCells.name() << endl;
+            protectedCells.write();
+        }
+
+    }
+}
+
+
+Foam::autoPtr<Foam::polyTopoChangeMap>
+Foam::fvMeshTopoChangers::myrefiner::refine
+(
+    const labelList& cellsToRefine
+)
+{
+    mesh().preChange();
+
+    // Mesh changing engine.
+    polyTopoChange meshMod(mesh());
+
+    // Play refinement commands into mesh changer.
+    meshCutter_.setRefinement(cellsToRefine, meshMod);
+
+    // Create mesh
+    // return map from old to new mesh.
+    autoPtr<polyTopoChangeMap> map = meshMod.changeMesh(mesh());
+
+    Info<< "Refined from "
+        << returnReduce(map().nOldCells(), sumOp())
+        << " to " << mesh().globalData().nTotalCells() << " cells." << endl;
+
+    if (debug)
+    {
+        // Check map.
+        for (label facei = 0; facei < mesh().nInternalFaces(); facei++)
+        {
+            const label oldFacei = map().faceMap()[facei];
+
+            if (oldFacei >= mesh().nInternalFaces())
+            {
+                FatalErrorInFunction
+                    << "New internal face:" << facei
+                    << " fc:" << mesh().faceCentres()[facei]
+                    << " originates from boundary oldFace:" << oldFacei
+                    << abort(FatalError);
+            }
+        }
+    }
+
+    // Update fields
+    mesh().topoChange(map);
+
+    {
+        // Correct the flux for modified/added faces. All the faces which only
+        // have been renumbered will already have been handled by the mapping.
+        const labelList& faceMap = map().faceMap();
+        const labelList& reverseFaceMap = map().reverseFaceMap();
+
+        // Storage for any master faces. These will be the original faces
+        // on the coarse cell that get split into four (or rather the
+        // master face gets modified and three faces get added from the master)
+        labelHashSet masterFaces(4*cellsToRefine.size());
+
+        forAll(faceMap, facei)
+        {
+            const label oldFacei = faceMap[facei];
+
+            if (oldFacei >= 0)
+            {
+                const label masterFacei = reverseFaceMap[oldFacei];
+
+                if (masterFacei < 0)
+                {
+                    FatalErrorInFunction
+                        << "Problem: should not have removed faces"
+                        << " when refining."
+                        << nl << "face:" << facei << abort(FatalError);
+                }
+                else if (masterFacei != facei)
+                {
+                    masterFaces.insert(masterFacei);
+                }
+            }
+        }
+        if (debug)
+        {
+            Pout<< "Found " << masterFaces.size() << " split faces " << endl;
+        }
+
+        refineFluxes(masterFaces, map());
+        refineUfs(masterFaces, map());
+    }
+
+    if (rebuildProtectedCells_)
+    {
+        // Cells selection process requires protectedCells_ to be updated
+        protectedCellsDirty_ = true;
+    }
+    // Update numbering of protectedCells_
+    else if (protectedCells_.size())
+    {
+        PackedBoolList newProtectedCell(mesh().nCells());
+
+        forAll(newProtectedCell, celli)
+        {
+            const label oldCelli = map().cellMap()[celli];
+            newProtectedCell.set(celli, protectedCells_.get(oldCelli));
+        }
+        protectedCells_.transfer(newProtectedCell);
+    }
+
+    // Debug: Check refinement levels (across faces only)
+    meshCutter_.checkRefinementLevels(-1, labelList(0));
+
+    return map;
+}
+
+
+Foam::autoPtr<Foam::polyTopoChangeMap>
+Foam::fvMeshTopoChangers::myrefiner::unrefine
+(
+    const labelList& splitPoints
+)
+{
+    mesh().preChange();
+
+    // Mesh changing engine.
+    polyTopoChange meshMod(mesh());
+
+    // Play refinement commands into mesh changer.
+    meshCutter_.setUnrefinement(splitPoints, meshMod);
+
+
+    // Save information on faces that will be combined
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    // Find the faceMidPoints on cells to be combined.
+    // for each face resulting of split of face into four store the
+    // midpoint
+    Map<label> faceToSplitPoint(3*splitPoints.size());
+
+    {
+        forAll(splitPoints, i)
+        {
+            const label pointi = splitPoints[i];
+            const labelList& pEdges = mesh().pointEdges()[pointi];
+
+            forAll(pEdges, j)
+            {
+                const label otherPointi =
+                    mesh().edges()[pEdges[j]].otherVertex(pointi);
+
+                const labelList& pFaces = mesh().pointFaces()[otherPointi];
+
+                forAll(pFaces, pFacei)
+                {
+                    faceToSplitPoint.insert(pFaces[pFacei], otherPointi);
+                }
+            }
+        }
+    }
+
+
+    // Change mesh and generate map.
+    autoPtr<polyTopoChangeMap> map = meshMod.changeMesh(mesh());
+
+    // Info of unrefinement operation
+    const label nCellsBefore = returnReduce(map().nOldCells(), sumOp());
+    const label nCellsAfter = mesh().globalData().nTotalCells();
+    const label nUnrefinedCells = nCellsBefore - nCellsAfter;
+
+    Info<< "Unrefined from " << nCellsBefore
+        << " to " << nCellsAfter << " cells." << endl;
+
+
+    if (dumpRefinementInfo_)
+    {
+        setInfo("nTotUnrefined", nUnrefinedCells);
+
+    }
+
+    if (debug)
+    {
+        Info<< "Unrefined cells: " << nUnrefinedCells << endl;
+        
+        // Store the identifiers of cells removed by unrefinement
+        const labelList& reverseCellMap = map().reverseCellMap();
+        PackedBoolList cellMask(reverseCellMap.size());
+
+        forAll(reverseCellMap, oldCelli)
+        {
+            if (reverseCellMap[oldCelli] < 0)
+            {
+                cellMask.set(oldCelli, 1);
+            }
+        }
+
+        labelList unrefinedCells(cellMask.used());
+
+        setDumpList<&myrefiner::unrefinedCells_>
+        (
+            unrefinedCells,
+            "unrefinedCells"
+        );
+
+        Info 
+            << "Unrefined cells set size: "
+            << returnReduce(unrefinedCells_->size(), sumOp())
+            << endl;
+    }
+
+    // Update fields
+    mesh().topoChange(map);
+
+    // Correct the fluxes for modified faces
+    unrefineFluxes(faceToSplitPoint, map());
+
+    // Correct the face velocities for modified faces
+    unrefineUfs(faceToSplitPoint, map());
+
+    if (rebuildProtectedCells_)
+    {
+        // Cells selection process requires protectedCells_ to be updated
+        protectedCellsDirty_ = true;
+    }
+    // Update numbering of protectedCells_
+    else if (protectedCells_.size())
+    {
+        PackedBoolList newProtectedCell(mesh().nCells());
+
+        forAll(newProtectedCell, celli)
+        {
+            const label oldCelli = map().cellMap()[celli];
+            if (oldCelli >= 0)
+            {
+                newProtectedCell.set(celli, protectedCells_.get(oldCelli));
+            }
+        }
+        protectedCells_.transfer(newProtectedCell);
+    }
+
+    // Debug: Check refinement levels (across faces only)
+    meshCutter_.checkRefinementLevels(-1, labelList(0));
+
+    return map;
+}
+
+
+Foam::word Foam::fvMeshTopoChangers::myrefiner::Uname
+(
+    const surfaceVectorField& Uf
+) const
+{
+    const word UfName(Uf.member());
+
+    return
+        IOobject::groupName
+        (
+            UfName.back() == 'f'
+          ? word(UfName(UfName.size() - 1))
+          : UfName.compare(UfName.size() - 3, 3, "f_0") == 0
+            ? word(UfName(UfName.size() - 3) + "_0")
+            : word::null,
+            Uf.group()
+        );
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::refineFluxes
+(
+    const labelHashSet& masterFaces,
+    const polyTopoChangeMap& map
+)
+{
+    if (correctFluxes_.size())
+    {
+        UPtrList<surfaceScalarField> fluxes
+        (
+            mesh().fields<surfaceScalarField>()
+        );
+
+        forAll(fluxes, i)
+        {
+            surfaceScalarField& flux = fluxes[i];
+
+            if (!correctFluxes_.found(flux.name()))
+            {
+                WarningInFunction
+                    << "Cannot find surfaceScalarField " << flux.name()
+                    << " in user-provided flux mapping table "
+                    << correctFluxes_ << endl
+                    << "    The flux mapping table is used to recreate the"
+                    << " flux on newly created faces." << endl
+                    << "    Either add the entry if it is a flux or use ("
+                    << flux.name() << " none) to suppress this warning."
+                    << endl;
+            }
+            else
+            {
+                const word& method = correctFluxes_[flux.name()];
+
+                if (method == "none")
+                {}
+                else if (method == "NaN")
+                {
+                    Pout<< "Setting surfaceScalarField " << flux.name()
+                        << " to NaN" << endl;
+
+                    sigFpe::fillNan(flux.primitiveFieldRef());
+                }
+                else
+                {
+                    FatalErrorInFunction
+                        << "Unknown refinement method " << method
+                        << " for surfaceScalarField " << flux.name()
+                        << " in user-provided flux mapping table "
+                        << correctFluxes_
+                        << exit(FatalError);
+                }
+            }
+        }
+    }
+}
+
+void Foam::fvMeshTopoChangers::myrefiner::unrefineFluxes
+(
+    const Map<label>& faceToSplitPoint,
+    const polyTopoChangeMap& map
+)
+{
+    if (correctFluxes_.size())
+    {
+        UPtrList<surfaceScalarField> fluxes
+        (
+            mesh().fields<surfaceScalarField>()
+        );
+
+        forAll(fluxes, i)
+        {
+            surfaceScalarField& flux = fluxes[i];
+
+            if (!correctFluxes_.found(flux.name()))
+            {
+                WarningInFunction
+                    << "Cannot find surfaceScalarField " << flux.name()
+                    << " in user-provided flux mapping table "
+                    << correctFluxes_ << endl
+                    << "    The flux mapping table is used to recreate the"
+                    << " flux on newly created faces." << endl
+                    << "    Either add the entry if it is a flux or use ("
+                    << flux.name() << " none) to suppress this warning."
+                    << endl;
+            }
+            else
+            {
+                const word& method = correctFluxes_[flux.name()];
+
+                if (method != "none")
+                {
+                    FatalErrorInFunction
+                        << "Unknown unrefinement method " << method
+                        << " for surfaceScalarField " << flux.name()
+                        << " in user-provided flux mapping table "
+                        << correctFluxes_
+                        << exit(FatalError);
+                }
+            }
+        }
+    }
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::refineUfs
+(
+    const labelHashSet& masterFaces,
+    const polyTopoChangeMap& map
+)
+{
+    const labelList& faceMap = map.faceMap();
+    const labelList& reverseFaceMap = map.reverseFaceMap();
+
+    // Interpolate U to Uf for added faces
+    UPtrList<surfaceVectorField> Ufs(mesh().fields<surfaceVectorField>());
+
+    forAll(Ufs, i)
+    {
+        surfaceVectorField& Uf = Ufs[i];
+
+        const word Uname(this->Uname(Uf));
+
+        if (Uname != word::null)
+        {
+            const surfaceVectorField UfU
+            (
+                fvc::interpolate(mesh().lookupObject<volVectorField>(Uname))
+            );
+
+            // Recalculate new internal faces.
+            for (label facei = 0; facei < mesh().nInternalFaces(); facei++)
+            {
+                label oldFacei = faceMap[facei];
+
+                if (oldFacei == -1)
+                {
+                    // Inserted
+                    Uf[facei] = UfU[facei];
+                }
+                else if (reverseFaceMap[oldFacei] != facei)
+                {
+                    // face-from-masterface
+                    Uf[facei] = UfU[facei];
+                }
+            }
+
+            // Recalculate new boundary faces.
+            surfaceVectorField::BoundaryField& UfBf = Uf.boundaryFieldRef();
+            forAll(UfBf, patchi)
+            {
+                fvsPatchVectorField& patchUf = UfBf[patchi];
+                const fvsPatchVectorField& patchUfU =
+                    UfU.boundaryField()[patchi];
+
+                label facei = patchUf.patch().start();
+
+                forAll(patchUf, i)
+                {
+                    label oldFacei = faceMap[facei];
+
+                    if (oldFacei == -1)
+                    {
+                        // Inserted/appended
+                        patchUf[i] = patchUfU[i];
+                    }
+                    else if (reverseFaceMap[oldFacei] != facei)
+                    {
+                        // face-from-master-face
+                        patchUf[i] = patchUfU[i];
+                    }
+
+                    facei++;
+                }
+            }
+
+            // Update master faces
+            forAllConstIter(labelHashSet, masterFaces, iter)
+            {
+                label facei = iter.key();
+
+                if (mesh().isInternalFace(facei))
+                {
+                    Uf[facei] = UfU[facei];
+                }
+                else
+                {
+                    const label patchi =
+                        mesh().poly().boundary().whichPatch(facei);
+                    const label i =
+                        facei - mesh().poly().boundary()[patchi].start();
+
+                    const fvsPatchVectorField& patchUfU =
+                        UfU.boundaryField()[patchi];
+
+                    fvsPatchVectorField& patchUf = UfBf[patchi];
+
+                    patchUf[i] = patchUfU[i];
+                }
+            }
+        }
+    }
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::unrefineUfs
+(
+    const Map<label>& faceToSplitPoint,
+    const polyTopoChangeMap& map
+)
+{
+    const labelList& reversePointMap = map.reversePointMap();
+    const labelList& reverseFaceMap = map.reverseFaceMap();
+
+    // Interpolate U to Uf for added faces
+    UPtrList<surfaceVectorField> Ufs(mesh().fields<surfaceVectorField>());
+
+    forAll(Ufs, i)
+    {
+        surfaceVectorField& Uf = Ufs[i];
+
+        const word Uname(this->Uname(Uf));
+
+        if (Uname != word::null)
+        {
+            surfaceVectorField::BoundaryField& UfBf = Uf.boundaryFieldRef();
+
+            const surfaceVectorField UfU
+            (
+                fvc::interpolate(mesh().lookupObject<volVectorField>(Uname))
+            );
+
+            forAllConstIter(Map<label>, faceToSplitPoint, iter)
+            {
+                const label oldFacei = iter.key();
+                const label oldPointi = iter();
+
+                if (reversePointMap[oldPointi] < 0)
+                {
+                    // midpoint was removed. See if face still exists.
+                    const label facei = reverseFaceMap[oldFacei];
+
+                    if (facei >= 0)
+                    {
+                        if (mesh().isInternalFace(facei))
+                        {
+                            Uf[facei] = UfU[facei];
+                        }
+                        else
+                        {
+                            const label patchi =
+                                mesh().poly().boundary().whichPatch(facei);
+                            const label i =
+                                facei - mesh().poly().boundary()[patchi].start();
+
+                            UfBf[patchi][i] = UfU.boundaryField()[patchi][i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+const Foam::cellZone& Foam::fvMeshTopoChangers::myrefiner::findCellZone
+(
+    const word& cellZoneName
+) const
+{
+    const label cellZoneID = mesh().cellZones().findIndex(cellZoneName);
+
+    bool cellZoneFound = (cellZoneID != -1);
+    reduce(cellZoneFound, orOp());
+
+    if (!cellZoneFound)
+    {
+        FatalErrorInFunction
+            << "cannot find cellZone " << cellZoneName
+            << exit(FatalError);
+    }
+
+    return mesh().cellZones()[cellZoneID];
+}
+
+
+Foam::scalarField Foam::fvMeshTopoChangers::myrefiner::error
+(
+    const scalarField& fld,
+    const scalar minLevel,
+    const scalar maxLevel
+) const
+{
+    scalarField c(fld.size(), -1);
+
+    forAll(c, celli)
+    {
+        scalar err = min(fld[celli] - minLevel, maxLevel - fld[celli]);
+
+        if (err >= 0)
+        {
+            c[celli] = err;
+        }
+    }
+
+    return c;
+}
+
+
+Foam::scalarField Foam::fvMeshTopoChangers::myrefiner::error
+(
+    const scalarField& fld,
+    const labelList& cells,
+    const scalar minLevel,
+    const scalar maxLevel
+) const
+{
+    scalarField c(fld.size(), -1);
+
+    forAll(cells, i)
+    {
+        const label celli = cells[i];
+        scalar err = min(fld[celli] - minLevel, maxLevel - fld[celli]);
+
+        if (err >= 0)
+        {
+            c[celli] = err;
+        }
+    }
+
+    return c;
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::selectRefineCandidates
+(
+    PackedBoolList& candidateCells,
+    const scalar lowerRefineLevel,
+    const scalar upperRefineLevel,
+    const scalar maxRefinement,
+    const scalarField& vFld,
+    scalarField& cellError
+) const
+{
+    // Get error per cell. Is -1 (not to be refined) to >=0 (to be refined,
+    // higher more desirable to be refined).
+    cellError = error(vFld, lowerRefineLevel, upperRefineLevel);
+
+    // Store into registry
+    if (dumpRefinementFields_)
+    {
+        setDumpField<&myrefiner::cellError_>
+        (
+            cellError,
+            "cellError"
+        );
+    }
+
+    // Mark cells that are candidates for refinement.
+    forAll(cellError, celli)
+    {
+        if (cellError[celli] >= 0)
+        {
+            candidateCells.set(celli, 1);
+        }
+    }
+
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::selectRefineCandidates
+(
+    PackedBoolList& candidateCells,
+    const scalar lowerRefineLevel,
+    const scalar upperRefineLevel,
+    const scalar maxRefinement,
+    const scalarField& vFld,
+    scalarField& cellError,
+    const labelList& cells
+) const
+{
+    // Get error per cell. Is -1 (not to be refined) to >0 (to be refined,
+    // higher more desirable to be refined).
+    cellError = error(vFld, cells, lowerRefineLevel, upperRefineLevel);
+
+    // Store into registry
+    if (dumpRefinementFields_)
+    {
+        setDumpField<&myrefiner::cellError_>
+        (
+            cellError,
+            "cellError"
+        );
+    }
+
+    // Mark cells that are candidates for refinement.
+    forAll(cellError, celli)
+    {
+        if (cellError[celli] >= 0)
+        {
+            candidateCells.set(celli, 1);
+        }
+    }
+
+}
+
+
+Foam::scalar Foam::fvMeshTopoChangers::myrefiner::selectRefineCandidates
+(
+    PackedBoolList& candidateCells,
+    const dictionary& refineDict,
+    scalarField& cellError
+) const
+{
+    const word fieldName(refineDict.lookup("field"));
+
+    const volScalarField& vFld = mesh().lookupObject<volScalarField>(fieldName);
+
+    const scalar lowerRefineLevel =
+        refineDict.lookupOrDefault<scalar>
+        (
+            "lowerRefineLevel",
+            -GREAT
+        );
+    const scalar upperRefineLevel =
+        refineDict.lookupOrDefault<scalar>
+        (
+            "upperRefineLevel",
+            GREAT
+        );
+
+    const label maxRefinement = refineDict.lookup<label>("maxRefinement");
+
+    if (maxRefinement <= 0)
+    {
+        FatalErrorInFunction
+            << "Illegal maximum refinement level " << maxRefinement << nl
+            << "The maxCells setting in the dynamicMeshDict should"
+            << " be > 0." << nl
+            << exit(FatalError);
+    }
+
+    if (refineDict.found("cellZone"))
+    {
+        // Determine candidates for refinement (looking at field only)
+        selectRefineCandidates
+        (
+            candidateCells,
+            lowerRefineLevel,
+            upperRefineLevel,
+            maxRefinement,
+            vFld,
+            cellError,
+            findCellZone(refineDict.lookup("cellZone"))
+        );
+    }
+    else
+    {
+        // Determine candidates for refinement (looking at field only)
+        selectRefineCandidates
+        (
+            candidateCells,
+            lowerRefineLevel,
+            upperRefineLevel,
+            maxRefinement,
+            vFld,
+            cellError
+        );
+    }
+
+    return maxRefinement;
+}
+
+
+Foam::labelList Foam::fvMeshTopoChangers::myrefiner::selectRefineCells
+(
+    const label maxCells,
+    const label maxRefinement,
+    const PackedBoolList& candidateCells,
+    const scalarField& cellError
+) const
+{
+    // Every refined cell causes 7 extra cells
+    const label availableCells = maxCells - mesh().globalData().nTotalCells();
+    label nTotToRefine = availableCells/7;
+
+    if (nTotToRefine <= 0)
+    {
+        Info<< "No cells to refine." << endl;
+        return labelList();
+    }
+
+    // Mark cells that cannot be refined since they would trigger refinement
+    // of protected cells (since 2:1 cascade)
+    if (rebuildProtectedCells_ && protectedCellsDirty_)
+    {
+        buildProtectedCells();
+        protectedCellsDirty_ = false;
+    }
+    PackedBoolList unrefineableCells;
+    calculateProtectedCells(unrefineableCells);
+
+    // Count current selection
+    const label nLocalCandidates = count(candidateCells, 1);
+    const label nCandidates = returnReduce(nLocalCandidates, sumOp());
+    const label nLocalUnrefineable = count(unrefineableCells, 1);
+    const label nUnrefineable = returnReduce(nLocalUnrefineable, sumOp());
+
+    if (debug)
+    {
+        const label nProtected = returnReduce
+        (
+            count(protectedCells_, 1),
+            sumOp()
+        );
+
+        Info<< "Protected refinement cells:"
+            << " baseProtected=" << nProtected
+            << ", unrefineableWithBuffer=" << nUnrefineable
+            << endl;
+    }
+
+    // Cache if unrefineableCells is empty
+    const bool hasUnrefineable = !unrefineableCells.empty();
+
+    // Collect all cells
+    DynamicList<label> candidates(nLocalCandidates);
+    scalar upperLimitLocal = -GREAT;
+    scalar lowerLimitLocal = GREAT;
+
+    // Number of cells to select
+    const label nToSelect = min(nCandidates, nTotToRefine);
+
+    if (dumpRefinementInfo_)
+    {
+        setInfo("nTotToRefine", nTotToRefine);
+        setInfo("nCandidates", nCandidates);
+        setInfo("nSelected", nToSelect);
+        setInfo("nUnrefineable", nUnrefineable);
+    }
+
+    if (nToSelect <= 0)
+    {
+        Info<< "No cells selected for refinement" << endl;
+        return labelList();
+    }
+
+    // If we're not cutting selected cells, just pick them all
+    if (nToSelect == nCandidates)
+    {
+        forAll(candidateCells, celli)
+        {
+            const bool isCandidate = candidateCells.get(celli);
+            const bool isOk =
+                !hasUnrefineable || !unrefineableCells.get(celli);
+
+            if (isCandidate && isOk)
+            {
+                candidates.append(celli);
+                upperLimitLocal = max(upperLimitLocal, cellError[celli]);
+                lowerLimitLocal = min(lowerLimitLocal, cellError[celli]);
+            }
+        }
+    }
+    else
+    {
+        // Otherwise select top nToSelect cells
+        DynamicList<label> eligibleCells(nLocalCandidates);
+        DynamicList<scalar> eligibleErrors(nLocalCandidates);
+
+        forAll(candidateCells, celli)
+        {
+            const bool isCandidate = candidateCells.get(celli);
+            const bool isOk =
+                !hasUnrefineable || !unrefineableCells.get(celli);
+
+            if (isCandidate && isOk)
+            {
+                eligibleCells.append(celli);
+                eligibleErrors.append(cellError[celli]);
+            }
+        }
+
+        const labelList eligibleCellList(eligibleCells.shrink());
+        const scalarField eligibleErrorList(eligibleErrors.shrink());
+
+        SortableList<scalar> sortedEligibleErrors(eligibleErrorList);
+        sortedEligibleErrors.reverseSort();
+
+        const label nLocalTop =
+            min(sortedEligibleErrors.size(), nToSelect);
+
+        if (Pstream::parRun())
+        {
+            const globalIndex globalNumbering(mesh().nCells());
+            scalarField localTopErrors(nLocalTop);
+            labelList localTopGlobalCells(nLocalTop);
+
+            for (label i = 0; i < nLocalTop; ++i)
+            {
+                const label eligiblei = sortedEligibleErrors.indices()[i];
+
+                localTopErrors[i] = sortedEligibleErrors[i];
+                localTopGlobalCells[i] =
+                    globalNumbering.toGlobal(eligibleCellList[eligiblei]);
+            }
+
+            List<scalarField> gatheredTopErrors(Pstream::nProcs());
+            List<labelList> gatheredTopGlobalCells(Pstream::nProcs());
+
+            gatheredTopErrors[Pstream::myProcNo()].transfer(localTopErrors);
+            gatheredTopGlobalCells[Pstream::myProcNo()].transfer
+            (
+                localTopGlobalCells
+            );
+
+            Pstream::gatherList(gatheredTopErrors);
+            Pstream::scatterList(gatheredTopErrors);
+            Pstream::gatherList(gatheredTopGlobalCells);
+            Pstream::scatterList(gatheredTopGlobalCells);
+
+            const scalarField topErrors
+            (
+                ListListOps::combine<scalarList>
+                (
+                    gatheredTopErrors,
+                    accessOp()
+                )
+            );
+            const labelList topGlobalCells
+            (
+                ListListOps::combine<labelList>
+                (
+                    gatheredTopGlobalCells,
+                    accessOp()
+                )
+            );
+
+            SortableList<scalar> sortedTopErrors(topErrors);
+            sortedTopErrors.reverseSort();
+
+            labelHashSet selectedGlobalCells(2*nToSelect);
+
+            for
+            (
+                label i = 0;
+                i < sortedTopErrors.size()
+             && selectedGlobalCells.size() < nToSelect;
+                ++i
+            )
+            {
+                const label selectedi = sortedTopErrors.indices()[i];
+
+                if (selectedGlobalCells.insert(topGlobalCells[selectedi]))
+                {
+                    upperLimitLocal =
+                        max(upperLimitLocal, sortedTopErrors[i]);
+                    lowerLimitLocal =
+                        min(lowerLimitLocal, sortedTopErrors[i]);
+                }
+            }
+
+            forAll(eligibleCellList, i)
+            {
+                if
+                (
+                    selectedGlobalCells.found
+                    (
+                        globalNumbering.toGlobal(eligibleCellList[i])
+                    )
+                )
+                {
+                    candidates.append(eligibleCellList[i]);
+                }
+            }
+        }
+        else
+        {
+            for (label i = 0; i < nLocalTop; ++i)
+            {
+                const label eligiblei = sortedEligibleErrors.indices()[i];
+                const label celli = eligibleCellList[eligiblei];
+
+                candidates.append(celli);
+                upperLimitLocal =
+                    max(upperLimitLocal, sortedEligibleErrors[i]);
+                lowerLimitLocal =
+                    min(lowerLimitLocal, sortedEligibleErrors[i]);
+            }
+        }
+    }
+
+    // Guarantee 2:1 refinement after refinement
+    const labelList baseCandidates(candidates.shrink());
+    labelList consistentSet
+    (
+        meshCutter_.consistentRefinement
+        (
+            baseCandidates,
+            true               // Add to set to guarantee 2:1
+        )
+    );
+
+    // Remove added cells if they contain protected cells
+    if (!unrefineableCells.empty())
+    {
+        bool hasProtected = false;
+
+        forAll(consistentSet, i)
+        {
+            if (unrefineableCells.get(consistentSet[i]))
+            {
+                hasProtected = true;
+                break;
+            }
+        }
+
+        if (returnReduce(hasProtected, orOp()))
+        {
+            consistentSet = meshCutter_.consistentRefinement
+            (
+                baseCandidates,
+                false
+            );
+        }
+    }
+
+    // Print out info
+    const label nTotCandidates = returnReduce(candidates.size(), sumOp());
+    if (nTotCandidates == 0)
+    {
+        Info<< "No cells selected for refinement after protected-cell filtering."
+            << endl;
+
+        return labelList();
+    }
+
+    const label nTot = returnReduce(consistentSet.size(), sumOp());
+    const scalar upperLimit =
+        returnReduce(upperLimitLocal, maxOp());
+    const scalar lowerLimit =
+        returnReduce(lowerLimitLocal, minOp());
+
+    Info
+        << "Selected " << nTot
+        << " cells for refinement out of " << mesh().globalData().nTotalCells()
+        << "." << endl;
+
+    if (dumpRefinementInfo_)
+    {
+        setInfo("nTotRefined", nTot);
+        setInfo("upperLimit", upperLimit);
+        setInfo("lowerLimit", lowerLimit);
+    }
+
+    if (debug)
+    {
+        setDumpList<&myrefiner::refinedCells_>
+        (
+            consistentSet,
+            "refinedCells"
+        );
+
+        Info
+            << "Refinement level range "
+            << "[" << lowerLimit << " - " << upperLimit << "]" << endl
+            << "Refined cells: " << nTot << endl
+            << "Refined cells set size: "
+            << returnReduce(refinedCells_->size(), sumOp())
+            << endl;
+    }
+
+    return consistentSet;
+}
+
+
+Foam::labelList Foam::fvMeshTopoChangers::myrefiner::selectUnrefinePoints
+(
+    const PackedBoolList& markedCell,
+    const dictionary& refineDict
+) const
+{
+    const  scalar unrefineLevel =
+        refineDict.lookupOrDefault<scalar>
+        (
+            "unrefineLevel",
+            -GREAT
+        );
+    const volScalarField& vFld =
+        mesh().lookupObject<volScalarField>
+        (
+            refineDict.lookup("field")
+        );
+    //
+    // All points that can be unrefined
+    const labelList splitPoints(meshCutter_.getSplitPoints());
+
+    DynamicList<label> newSplitPoints(splitPoints.size());
+
+    bool hasMarked = false;
+    bool aboveLevel = false;
+    boolList pointHasMarked(mesh().nPoints(), hasMarked);
+    boolList pointAboveLevel(mesh().nPoints(), aboveLevel);
+
+    // if (Pstream::parRun())
+    // {
+    //     DynamicList<label> processorPatchPoints(splitPoints.size());
+    //
+    //     forAll(splitPoints, i)
+    //     {
+    //         const label pointi = splitPoints[i];
+    //         const labelList& pFaces = mesh().pointFaces()[pointi];
+    //         forAll(pFaces, pFacei)
+    //         {
+    //             const label facei = pFaces[pFacei];
+    //             if (!mesh().isInternalFace(facei))
+    //             {
+    //                 const label patchi =
+    //                     mesh().poly().boundary().whichPatch(facei);
+    //                 const polyPatch& patch = mesh().poly().boundary()[patchi];
+    //                 if (isA<processorPolyPatch>(patch))
+    //                 {
+    //                     processorPatchPoints.append(pointi);
+    //                     break;
+    //                 }
+    //             }
+    //         }
+    //     }
+    //
+    //     if (processorPatchPoints.size())
+    //     {
+    //         processorPatchPoints.shrink();
+    //         // number of pointCells for each processorPatch point
+    //         forAll (processorPatchPoints, i)
+    //         {
+    //             const label pointi = processorPatchPoints[i];
+    //             const labelList& pCells = mesh().pointCells()[pointi];
+    //
+    //             Pout
+    //                 << "Debug stop: point " << pointi
+    //                 << " with neighbours cells " << pCells.size() << endl;
+    //         }
+    //     }
+    // }
+
+
+    forAll(splitPoints, i)
+    {
+        const label pointi = splitPoints[i];
+        const labelList& pCells = mesh().pointCells()[pointi];
+
+        // if (debug && Pstream::parRun())
+        // {
+        //     bool onProcessorPatch = false;
+        //     const labelList& pFaces = mesh().pointFaces()[pointi];
+        //     forAll(pFaces, pFacei)
+        //     {
+        //         const label facei = pFaces[pFacei];
+        //         if (!mesh().isInternalFace(facei))
+        //         {
+        //             const label patchi =
+        //                 mesh().poly().boundary().whichPatch(facei);
+        //             const polyPatch& patch = mesh().poly().boundary()[patchi];
+        //             if (isA<processorPolyPatch>(patch))
+        //             {
+        //                 onProcessorPatch = true;
+        //                 break;
+        //             }
+        //         }
+        //     }
+        //     if (onProcessorPatch)
+        //     {
+        //         FatalErrorInFunction
+        //             << "Debug stop: point " << pointi
+        //             << " is on processor patch. vFld values for point cells:"
+        //             << nl
+        //             << UIndirectList<scalar>(vFld, pCells)
+        //             << nl
+        //             << "cell ids: " << pCells
+        //             << exit(FatalError);
+        //     }
+        // }
+
+        forAll(pCells, i)
+        {
+            const label celli = pCells[i];
+            if (markedCell.get(celli))
+            {
+                pointHasMarked[pointi] = true;
+                break;
+            }
+
+            if (vFld[celli] >= unrefineLevel)
+            {
+                pointAboveLevel[pointi] = true;
+                break;
+            }
+        }
+    }
+
+    // label nLocalEligibleBefore = 0;
+    // forAll(splitPoints, i)
+    // {
+    //     const label pointi = splitPoints[i];
+    //     if (!pointHasMarked[pointi] && pointBelowLevel[pointi])
+    //     {
+    //         nLocalEligibleBefore++;
+    //     }
+    // }
+
+    // const label nEligibleBefore =
+    //     returnReduce(nLocalEligibleBefore, sumOp());
+
+    // Maybe syncing is overkill here, but safer
+    syncTools::syncPointList(mesh(), pointHasMarked, orEqOp(), hasMarked);
+    syncTools::syncPointList(mesh(), pointAboveLevel, orEqOp(), aboveLevel);
+
+    label nBlockedMarked = 0;
+    label nBlockedAboveLevel = 0;
+    label nBlockedBoth = 0;
+    label nCandidates = 0;
+
+    forAll(splitPoints, i)
+    {
+        const label pointi = splitPoints[i];
+        const bool blockedMarked = pointHasMarked[pointi];
+        const bool blockedAboveLevel = pointAboveLevel[pointi];
+
+        if (blockedMarked)
+        {
+            nBlockedMarked++;
+        }
+        if (blockedAboveLevel)
+        {
+            nBlockedAboveLevel++;
+        }
+        if (blockedMarked && blockedAboveLevel)
+        {
+            nBlockedBoth++;
+        }
+
+        if (!blockedMarked && !blockedAboveLevel)
+        {
+            newSplitPoints.append(pointi);
+            nCandidates++;
+        }
+    }
+
+    newSplitPoints.shrink();
+
+    // DebugInfo
+    //     << "Unrefine split points before sync (local/global): "
+    //     << nLocalEligibleBefore << " / " << nEligibleBefore
+    //     << ", after sync: "
+    //     << returnReduce(newSplitPoints.size(), sumOp())
+    //     << endl;
+
+    // Guarantee 2:1 refinement after unrefinement
+    labelList consistentSet
+    (
+        meshCutter_.consistentUnrefinement
+        (
+            newSplitPoints,
+            false
+        )
+    );
+
+    Info<< "Selected " << returnReduce(consistentSet.size(), sumOp())
+        << " split points out of a possible "
+        << returnReduce(splitPoints.size(), sumOp())
+        << "." << endl;
+
+    if (debug)
+    {
+        const label nCandidatesGlobal =
+            returnReduce(nCandidates, sumOp());
+        const label nSelectedGlobal =
+            returnReduce(consistentSet.size(), sumOp());
+
+        Info<< "Unrefine split point filter:"
+            << " blockedByMarked="
+            << returnReduce(nBlockedMarked, sumOp())
+            << ", blockedByField="
+            << returnReduce(nBlockedAboveLevel, sumOp())
+            << ", blockedByBoth="
+            << returnReduce(nBlockedBoth, sumOp())
+            << ", beforeConsistency=" << nCandidatesGlobal
+            << ", rejectedByConsistency="
+            << nCandidatesGlobal - nSelectedGlobal
+            << endl;
+    }
+
+    return consistentSet;
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::extendMarkedCells
+(
+    PackedBoolList& markedCell
+) const
+{
+    // Mark faces using any marked cell
+    boolList markedFace(mesh().nFaces(), false);
+
+    forAll(markedCell, celli)
+    {
+        if (markedCell.get(celli))
+        {
+            const cell& cFaces = mesh().cells()[celli];
+
+            forAll(cFaces, i)
+            {
+                markedFace[cFaces[i]] = true;
+            }
+        }
+    }
+
+    syncTools::syncFaceList(mesh(), markedFace, orEqOp());
+
+    // Update cells using any markedFace
+    for (label facei = 0; facei < mesh().nInternalFaces(); facei++)
+    {
+        if (markedFace[facei])
+        {
+            markedCell.set(mesh().faceOwner()[facei], 1);
+            markedCell.set(mesh().faceNeighbour()[facei], 1);
+        }
+    }
+
+    for
+    (
+        label facei = mesh().nInternalFaces();
+        facei < mesh().nFaces();
+        facei++
+    )
+    {
+        if (markedFace[facei])
+        {
+            markedCell.set(mesh().faceOwner()[facei], 1);
+        }
+    }
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::checkEightAnchorPoints
+(
+    PackedBoolList& protectedCell,
+    label& nProtected
+) const
+{
+    const labelList& cellLevel = meshCutter_.cellLevel();
+    const labelList& pointLevel = meshCutter_.pointLevel();
+
+    labelList nAnchorPoints(mesh().nCells(), 0);
+
+    forAll(pointLevel, pointi)
+    {
+        const labelList& pCells = mesh().pointCells(pointi);
+
+        forAll(pCells, pCelli)
+        {
+            const label celli = pCells[pCelli];
+
+            if (pointLevel[pointi] <= cellLevel[celli])
+            {
+                // Check if cell has already 8 anchor points -> protect cell
+                if (nAnchorPoints[celli] == 8)
+                {
+                    if (protectedCell.set(celli, true))
+                    {
+                        nProtected++;
+                    }
+                }
+
+                if (!protectedCell[celli])
+                {
+                    nAnchorPoints[celli]++;
+                }
+            }
+        }
+    }
+
+    forAll(protectedCell, celli)
+    {
+        if (!protectedCell[celli] && nAnchorPoints[celli] != 8)
+        {
+            protectedCell.set(celli, true);
+            nProtected++;
+        }
+    }
+}
+
+
+// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
+
+Foam::fvMeshTopoChangers::myrefiner::myrefiner(fvMesh& mesh, const dictionary& dict)
+:
+    fvMeshTopoChanger(mesh),
+    dict_(dict),
+    initialCells_(mesh.globalData().nTotalCells()),
+    meshCutter_(mesh),
+    dumpLevel_(false),
+    dumpRefinementInfo_(false),
+    dumpRefinementFields_(false),
+    dumpProtectedCells_(false),
+    rebuildProtectedCells_(false),
+    nRefinementIterations_(0),
+    protectedCells_(mesh.nCells(), 0),
+    changedSinceWrite_(false),
+    protectedCellsDirty_(false),
+    timeIndex_(-1)
+{
+    // Read static part of dictionary
+    readDict();
+
+    // Build protected cells
+    buildProtectedCells();
+}
+
+
+// * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
+
+Foam::fvMeshTopoChangers::myrefiner::~myrefiner()
+{}
+
+
+// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+
+bool Foam::fvMeshTopoChangers::myrefiner::update()
+{
+    clockTime wallClock;
+    const scalar cpuStart = mesh().time().elapsedCpuTime();
+
+    // Re-read dictionary. Chosen since usually -small so trivial amount
+    // of time compared to actual refinement. Also very useful to be able
+    // to modify on-the-fly.
+    dict_ = 
+        IOdictionary
+        (
+            IOobject
+            (
+                "dynamicMeshDict",
+                mesh().time().constant(),
+                mesh(),
+                IOobject::MUST_READ,
+                IOobject::NO_WRITE,
+                false
+            )
+        ).subDict("topoChanger");
+
+    // Only refine on the first call in a time-step
+    if (timeIndex_ != mesh().time().timeIndex())
+    {
+        timeIndex_ = mesh().time().timeIndex();
+    }
+    else
+    {
+        return false;
+    }
+
+    bool hasChanged = false;
+
+    // read dynamic part of dictionary
+    refineInterval_.reset
+    (
+        Function1<scalar>::New("refineInterval", dimTime, dimless, dict_).ptr()
+    );
+    unrefineInterval_ =
+        dict_.lookupOrDefault<label>("unrefineInterval", 1);
+    maxCells_.reset
+    (
+        Function1<scalar>::New("maxCells", dimTime, dimless, dict_).ptr()
+    );
+    const label maxCells = currentMaxCells(initialCells_);
+    dumpRefinementInfo_ =
+        dict_.lookupOrDefault<bool>("dumpRefinementInfo", false);
+    dumpRefinementFields_ =
+        dict_.lookupOrDefault<bool>("dumpRefinementFields", false);
+    dumpProtectedCells_ =
+        dict_.lookupOrDefault<bool>("dumpProtectedCells", false);
+
+    if (dumpRefinementFields_)
+    {
+        makeDumpField(cellError_, "cellError");
+    }
+
+    const bool wasRebuildingProtectedCells = rebuildProtectedCells_;
+    rebuildProtectedCells_ =
+        dict_.lookupOrDefault<bool>("rebuildProtectedCells", false);
+    if (rebuildProtectedCells_ && !wasRebuildingProtectedCells)
+    {
+        protectedCellsDirty_ = true;
+    }
+
+    const label refineInterval = currentRefineInterval();
+
+    if (refineInterval == 0)
+    {
+        return hasChanged;
+    }
+
+    scalarField cellError;
+
+    // Note: cannot refine at time 0 since no V0 present since mesh not
+    //       moved yet.
+    if
+    (
+        mesh().time().timeIndex() > 0
+     && mesh().time().timeIndex() % refineInterval == 0
+    )
+    {
+        // Cells marked for refinement or otherwise protected from unrefinement.
+        PackedBoolList refineCells(mesh().nCells());
+
+        label maxRefinement = 0;
+
+        if (dict_.isDict("refinementRegions"))
+        {
+            const dictionary& refinementRegions
+            (
+                dict_.subDict("refinementRegions")
+            );
+
+            forAllConstIter(dictionary, refinementRegions, iter)
+            {
+                maxRefinement = max
+                (
+                    selectRefineCandidates
+                    (
+                        refineCells,
+                        refinementRegions.subDict(iter().keyword()),
+                        cellError
+                    ),
+                    maxRefinement
+                );
+            }
+        }
+        else
+        {
+            maxRefinement = selectRefineCandidates
+            (
+                refineCells,
+                dict_,
+                cellError
+            );
+        }
+
+        // maybe more usefull if nBufferLayers_ is being passed
+        // to meshCutter_.consistentRefinement ...
+        // Extend with a buffer layer to prevent neighbouring points
+        // being unrefined.
+        for (label i = 0; i < nBufferLayers_; i++)
+        {
+            extendMarkedCells(refineCells);
+        }
+
+        PackedBoolList refinableCells(refineCells);
+
+        {
+            const labelList& cellLevel = meshCutter_.cellLevel();
+
+            // Count cells that have reached max refinement
+            label reachedMaxRefinement = 0;
+
+            // Mark cells that are candidates for refinement.
+            forAll(cellLevel, celli)
+            {
+                if (cellLevel[celli] >= maxRefinement)
+                {
+                    reachedMaxRefinement++;
+                    refinableCells.unset(celli);
+                }
+            }
+
+            if (dumpRefinementInfo_)
+            {
+                reachedMaxRefinement = returnReduce
+                (
+                    reachedMaxRefinement,
+                    sumOp()
+                );
+                setInfo("nAtMaxRefinement", reachedMaxRefinement);
+            }
+        }
+
+        if (mesh().globalData().nTotalCells() < maxCells)
+        {
+            // Select subset of candidates. Take into account max allowable
+            // cells, refinement level, protected cells.
+            const labelList cellsToRefine
+            (
+                selectRefineCells
+                (
+                    maxCells,
+                    maxRefinement,
+                    refinableCells,
+                    cellError
+                )
+            );
+
+            const label nCellsToRefineLocal = cellsToRefine.size();
+            if (returnReduce(nCellsToRefineLocal, sumOp()) > 0)
+            {
+                // Refine/update mesh and map fields
+                autoPtr<polyTopoChangeMap> map = refine(cellsToRefine);
+
+                // Update refinableCells. Note that some of the marked ones have
+                // not been refined due to constraints.
+                {
+                    const labelList& cellMap = map().cellMap();
+                    const labelList& reverseCellMap = map().reverseCellMap();
+
+                    PackedBoolList newRefineCell(cellMap.size());
+
+                    forAll(cellMap, celli)
+                    {
+                        const label oldCelli = cellMap[celli];
+
+                        if (oldCelli < 0)
+                        {
+                            newRefineCell.set(celli, 1);
+                        }
+                        else if (reverseCellMap[oldCelli] != celli)
+                        {
+                            newRefineCell.set(celli, 1);
+                        }
+                        else
+                        {
+                            newRefineCell.set
+                            (
+                                celli,
+                                refinableCells.get(oldCelli)
+                            );
+                        }
+                    }
+                    refinableCells.transfer(newRefineCell);
+                }
+
+                hasChanged = true;
+            }
+            else
+            {
+                resetDumpInfo();
+            }
+        }
+        else
+        {
+            resetDumpInfo();
+        }
+
+        // Unrefine if reminder of nRefinementIterations_ / unrefineInterval_ == 0
+        if (
+            unrefineInterval_ > 0
+         && nRefinementIterations_ % unrefineInterval_ == 0
+        )
+        {
+            const labelList pointsToUnrefine
+            (
+                selectUnrefinePoints(refineCells, dict_)
+            );
+
+            const label nSplitPoints = returnReduce
+            (
+                pointsToUnrefine.size(),
+                sumOp()
+            );
+
+            if (nSplitPoints > 0)
+            {
+                // Refine/update mesh
+                unrefine(pointsToUnrefine);
+
+                hasChanged = true;
+            }
+
+            if (dumpRefinementInfo_)
+            {
+                setInfo("nCells", mesh().globalData().nTotalCells());
+            }
+        }
+
+        if ((nRefinementIterations_ % 10) == 0)
+        {
+            // Compact refinement history occasionally (how often?).
+            // Unrefinement causes holes in the refinementHistory.
+            const_cast<refinementHistory&>(meshCutter().history()).compact();
+        }
+        nRefinementIterations_++;
+    }
+
+    if (hasChanged)
+    {
+        changedSinceWrite_ = true;
+    }
+
+    if (debug && hasChanged)
+    {
+        Info<< typeName
+            << ": update timing at time " << mesh().time().name()
+            << " (cpu " << mesh().time().elapsedCpuTime() - cpuStart
+            << " s, wall " << wallClock.elapsedTime() << " s)" << endl;
+    }
+
+    return hasChanged;
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::topoChange(const polyTopoChangeMap& map)
+{
+    // Update numbering of cells/vertices.
+    meshCutter_.topoChange(map);
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::mapMesh(const polyMeshMap& map)
+{
+    // meshCutter_ will need to be re-constructed from the new mesh
+    // and protectedCells_ updated.
+    // The constructor should be refactored for the protectedCells_ update.
+    NotImplemented;
+}
+
+
+void Foam::fvMeshTopoChangers::myrefiner::distribute
+(
+    const polyDistributionMap& map
+)
+{
+    // Redistribute the mesh cutting engine
+    meshCutter_.distribute(map);
+}
+
+
+bool Foam::fvMeshTopoChangers::myrefiner::write(const bool write) const
+{
+    if (changedSinceWrite_)
+    {
+        // Force refinement data to go to the current time directory.
+        const_cast<hexRef8&>(meshCutter_).setInstance(mesh().time().name());
+
+        bool writeOk = meshCutter_.write(write);
+
+        if (dumpLevel_)
+        {
+            volScalarField scalarCellLevel
+            (
+                IOobject
+                (
+                    "cellLevel",
+                    mesh().time().name(),
+                    mesh(),
+                    IOobject::NO_READ,
+                    IOobject::AUTO_WRITE,
+                    false
+                ),
+                mesh(),
+                dimensionedScalar(dimless, 0)
+            );
+
+            const labelList& cellLevel = meshCutter_.cellLevel();
+
+            forAll(cellLevel, celli)
+            {
+                scalarCellLevel[celli] = cellLevel[celli];
+            }
+
+            writeOk = writeOk && scalarCellLevel.write();
+        }
+
+        changedSinceWrite_ = false;
+
+        if (dumpRefinementFields_ && cellError_.valid())
+        {
+            writeOk = writeOk && cellError_->write();
+        }
+
+        return writeOk;
+    }
+    else
+    {
+        return true;
+    }
+}
+
+
+// ************************************************************************* //
